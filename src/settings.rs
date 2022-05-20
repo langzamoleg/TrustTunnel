@@ -63,6 +63,8 @@ pub struct Settings {
     /// The ICMP forwarding settings.
     /// Setting up this feature requires superuser rights on some systems.
     pub(crate) icmp: Option<IcmpSettings>,
+    /// The metrics handling settings
+    pub(crate) metrics: Option<MetricsSettings>,
 }
 
 #[derive(Default, Deserialize)]
@@ -149,7 +151,7 @@ pub struct IcmpSettings {
     pub(crate) interface_name: String,
     /// Time out of tunneled ICMP requests
     #[serde(default = "IcmpSettings::default_request_timeout")]
-    #[serde(rename(deserialize = "urequest_timeout_secs"))]
+    #[serde(rename(deserialize = "request_timeout_secs"))]
     #[serde(deserialize_with = "deserialize_duration_secs")]
     pub(crate) request_timeout: Duration,
     /// The capacity of the ICMP multiplexer received messages queue.
@@ -158,6 +160,18 @@ pub struct IcmpSettings {
     /// Each client has its own queue.
     #[serde(default = "IcmpSettings::default_message_queue_capacity")]
     pub(crate) recv_message_queue_capacity: usize,
+}
+
+#[derive(Deserialize)]
+pub struct MetricsSettings {
+    /// The address to listen on for settings export requests
+    #[serde(default = "MetricsSettings::default_listen_address")]
+    pub(crate) address: SocketAddr,
+    /// Time out of a metrics request
+    #[serde(default = "MetricsSettings::default_request_timeout")]
+    #[serde(rename(deserialize = "request_timeout_secs"))]
+    #[serde(deserialize_with = "deserialize_duration_secs")]
+    pub(crate) request_timeout: Duration,
 }
 
 #[derive(Deserialize)]
@@ -257,6 +271,10 @@ pub struct IcmpSettingsBuilder {
     settings: IcmpSettings,
 }
 
+pub struct MetricsSettingsBuilder {
+    settings: MetricsSettings,
+}
+
 #[derive(Debug)]
 pub enum BuilderError {
     /// Invalid [`Settings.listen_address`]
@@ -312,6 +330,32 @@ impl Settings {
 
     fn default_udp_connections_timeout() -> Duration {
         Duration::from_secs(30)
+    }
+}
+
+#[cfg(test)]
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            threads_number: 0,
+            listen_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            tunnel_tls_host_info: Default::default(),
+            service_messenger_tls_host_info: None,
+            ipv6_available: false,
+            tls_handshake_timeout: Default::default(),
+            client_listener_timeout: Default::default(),
+            tcp_connections_timeout: Default::default(),
+            udp_connections_timeout: Default::default(),
+            forward_protocol: Default::default(),
+            listen_protocols: vec![
+                ListenProtocolSettings::Http1(Http1Settings::builder().build()),
+                ListenProtocolSettings::Http2(Http2Settings::builder().build()),
+                ListenProtocolSettings::Quic(QuicSettings::builder().build()),
+            ],
+            authorizer: Settings::default_authorizer(),
+            icmp: None,
+            metrics: Default::default(),
+        }
     }
 }
 
@@ -443,6 +487,29 @@ impl IcmpSettings {
     }
 }
 
+impl MetricsSettings {
+    fn builder() -> MetricsSettingsBuilder {
+        MetricsSettingsBuilder::new()
+    }
+
+    fn default_listen_address() -> SocketAddr {
+        (Ipv4Addr::UNSPECIFIED, 1987).into()
+    }
+
+    fn default_request_timeout() -> Duration {
+        Duration::from_secs(3)
+    }
+}
+
+impl Default for MetricsSettings {
+    fn default() -> Self {
+        Self {
+            address: MetricsSettings::default_listen_address(),
+            request_timeout: MetricsSettings::default_request_timeout(),
+        }
+    }
+}
+
 impl SettingsBuilder {
     fn new() -> Self {
         Self {
@@ -460,6 +527,7 @@ impl SettingsBuilder {
                 listen_protocols: vec![],
                 authenticator: Settings::default_authenticator(),
                 icmp: None,
+                metrics: Default::default(),
             },
             tunnel_tls_host_info_set: false,
             authenticator: None,
@@ -508,7 +576,7 @@ impl SettingsBuilder {
     pub fn listen_address<A: ToSocketAddrs>(mut self, addr: A) -> io::Result<Self> {
         self.settings.listen_address = addr.to_socket_addrs()?
             .next()
-            .ok_or_else(|| io::Error::new(ErrorKind::Other, "Parsed address to empty list"))?;
+            .ok_or_else(|| io::Error::new(ErrorKind::Other, "Address is parsed to empty list"))?;
         Ok(self)
     }
 
@@ -602,7 +670,7 @@ impl Socks5ForwarderSettingsBuilder {
     pub fn server_address<A: ToSocketAddrs>(mut self, v: A) -> io::Result<Self> {
         self.settings.address = v.to_socket_addrs()?
             .next()
-            .ok_or_else(|| io::Error::new(ErrorKind::Other, "Parsed address to empty list"))?;
+            .ok_or_else(|| io::Error::new(ErrorKind::Other, "Address is parsed to empty list"))?;
         Ok(self)
     }
 }
@@ -856,6 +924,33 @@ impl IcmpSettingsBuilder {
 
     /// Finalize [`IcmpSettings`]
     pub fn build(self) -> Result<IcmpSettings> {
+        Ok(self.settings)
+    }
+}
+
+impl MetricsSettingsBuilder {
+    fn new() -> Self {
+        Self {
+            settings: Default::default(),
+        }
+    }
+
+    /// Set the address to listen on for settings export requests
+    pub fn listen_address<A: ToSocketAddrs>(mut self, addr: A) -> io::Result<Self> {
+        self.settings.address = addr.to_socket_addrs()?
+            .next()
+            .ok_or_else(|| io::Error::new(ErrorKind::Other, "Address is parsed to empty list"))?;
+        Ok(self)
+    }
+
+    /// Set the metrics request timeout
+    pub fn request_timeout(mut self, v: Duration) -> Self {
+        self.settings.request_timeout = v;
+        self
+    }
+
+    /// Finalize [`MetricsSettings`]
+    pub fn build(self) -> Result<MetricsSettings> {
         Ok(self.settings)
     }
 }

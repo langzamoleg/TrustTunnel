@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::{TcpListener, UdpSocket};
 use crate::direct_forwarder::DirectForwarder;
-use crate::{downstream_protocol_selector, log_id, log_utils};
+use crate::{downstream_protocol_selector, log_id, log_utils, metrics};
 use crate::downstream_protocol_selector::{DownstreamProtocol, TunnelProtocol};
 use crate::forwarder::Forwarder;
 use crate::http1_codec::Http1Codec;
@@ -12,6 +12,7 @@ use crate::http2_codec::Http2Codec;
 use crate::http3_codec::Http3Codec;
 use crate::http_downstream::HttpDownstream;
 use crate::icmp_forwarder::IcmpForwarder;
+use crate::metrics::Metrics;
 use crate::quic_multiplexer::QuicMultiplexer;
 use crate::settings::{ForwardProtocolSettings, ListenProtocolSettings, Settings};
 use crate::shutdown::Shutdown;
@@ -25,12 +26,13 @@ pub struct Core {
 }
 
 
-struct Context {
-    core_settings: Arc<Settings>,
+pub(crate) struct Context {
+    pub settings: Arc<Settings>,
+    pub icmp_forwarder: Option<Arc<IcmpForwarder>>,
+    pub shutdown: Arc<Mutex<Shutdown>>,
+    pub metrics: Arc<Metrics>,
     next_client_id: Arc<AtomicU64>,
     next_tunnel_id: Arc<AtomicU64>,
-    icmp_forwarder: Option<Arc<IcmpForwarder>>,
-    shutdown: Arc<Mutex<Shutdown>>,
 }
 
 impl Core {
@@ -42,15 +44,16 @@ impl Core {
 
         Self {
             context: Arc::new(Context {
-                core_settings: settings.clone(),
-                next_client_id: Arc::new(AtomicU64::new(0)),
-                next_tunnel_id: Arc::new(AtomicU64::new(0)),
+                settings: settings.clone(),
                 icmp_forwarder: if settings.icmp.is_none() {
                     None
                 } else {
                     Some(Arc::new(IcmpForwarder::new(settings)))
                 },
                 shutdown,
+                metrics: Metrics::new().unwrap(),
+                next_client_id: Default::default(),
+                next_tunnel_id: Default::default(),
             }),
         }
     }
@@ -74,6 +77,8 @@ impl Core {
                 .map_err(|e| io::Error::new(e.kind(), format!("ICMP listener failure: {}", e)))
         };
 
+        let listen_metrics = metrics::listen(self.context.clone(), log_utils::IdChain::empty());
+
         let (mut shutdown_notification, _shutdown_completion) = {
             let shutdown = self.context.shutdown.lock().unwrap();
             (
@@ -87,10 +92,11 @@ impl Core {
             x = shutdown_notification.wait() => {
                 x.map_err(|e| io::Error::new(ErrorKind::Other, format!("{}", e)))
             },
-            x = futures::future::try_join3(
+            x = futures::future::try_join4(
                 listen_tcp,
                 listen_udp,
                 listen_icmp,
+                listen_metrics,
             ) => x.map(|_| ()),
         }
     }
@@ -100,7 +106,7 @@ impl Core {
     pub fn listen(&mut self) -> io::Result<()> {
         let runtime = {
             let context = self.context.clone();
-            let threads_num = context.core_settings.threads_number;
+            let threads_num = context.settings.threads_number;
             tokio::runtime::Builder::new_multi_thread()
                 .enable_io()
                 .enable_time()
@@ -116,7 +122,7 @@ impl Core {
     }
 
     async fn listen_tcp(&self) -> io::Result<()> {
-        let settings = self.context.core_settings.clone();
+        let settings = self.context.settings.clone();
         let has_tcp_based_codec = settings.listen_protocols.iter()
             .any(|x| match x {
                 ListenProtocolSettings::Http1(_) | ListenProtocolSettings::Http2(_) => true,
@@ -126,7 +132,7 @@ impl Core {
         let tcp_listener = TcpListener::bind(settings.listen_address).await?;
         info!("Listening to TCP {}", settings.listen_address);
 
-        let tls_listener = Arc::new(TlsListener::new(settings.clone()));
+        let tls_listener = Arc::new(TlsListener::new(self.context.settings.clone()));
         loop {
             let client_id = log_utils::IdChain::from(log_utils::IdItem::new(
                 log_utils::CLIENT_ID_FMT, self.context.next_client_id.fetch_add(1, Ordering::Relaxed)
@@ -150,7 +156,7 @@ impl Core {
                 let context = self.context.clone();
                 let tls_listener = tls_listener.clone();
                 async move {
-                    let handshake_timeout = context.core_settings.tls_handshake_timeout;
+                    let handshake_timeout = context.settings.tls_handshake_timeout;
                     match tokio::time::timeout(handshake_timeout, tls_listener.listen(stream))
                         .await
                         .unwrap_or_else(|_| Err(io::Error::from(ErrorKind::TimedOut)))
@@ -164,7 +170,7 @@ impl Core {
     }
 
     async fn listen_udp(&self) -> io::Result<()> {
-        let settings = self.context.core_settings.clone();
+        let settings = self.context.settings.clone();
         if !settings.listen_protocols.iter()
             .any(|x| match x {
                 ListenProtocolSettings::Http1(_) | ListenProtocolSettings::Http2(_) => false,
@@ -191,14 +197,17 @@ impl Core {
                 let socket_id = socket.id();
                 async move {
                     log_id!(debug, socket_id, "New QUIC connection");
+                    let _metrics_guard = Metrics::client_sessions_counter(
+                        context.metrics.clone(), TunnelProtocol::Http3,
+                    );
+
                     let mut tunnel = Tunnel::new(
-                        context.core_settings.clone(),
-                        context.shutdown.clone(),
+                        context.clone(),
                         Box::new(HttpDownstream::new(
-                            context.core_settings.clone(),
+                            context.settings.clone(),
                             Box::new(Http3Codec::new(socket, socket_id.clone())),
                         )),
-                        Self::make_forwarder(&context),
+                        Self::make_forwarder(context),
                         socket_id.clone(),
                     );
 
@@ -240,9 +249,9 @@ impl Core {
             None => None,
         };
 
-        let core_settings = context.core_settings.clone();
+        let core_settings = context.settings.clone();
         let proto =
-            match downstream_protocol_selector::select(core_settings.clone(), alpn.as_deref(), &sni) {
+            match downstream_protocol_selector::select(&core_settings, alpn.as_deref(), &sni) {
                 Ok(DownstreamProtocol::Tunnel(TunnelProtocol::Http3)) => {
                     log_id!(debug, client_id, "Unexpected connection protocol - dropping tunnel");
                     return;
@@ -269,14 +278,15 @@ impl Core {
         match proto {
             DownstreamProtocol::Tunnel(TunnelProtocol::Http3) => unreachable!(),
             DownstreamProtocol::Tunnel(protocol) => {
+                let _metrics_guard = Metrics::client_sessions_counter(context.metrics.clone(), protocol);
+
                 let tunnel_id = client_id.extended(log_utils::IdItem::new(
                     log_utils::TUNNEL_ID_FMT, context.next_tunnel_id.fetch_add(1, Ordering::Relaxed)
                 ));
 
                 log_id!(debug, tunnel_id, "New tunnel for client");
                 let mut tunnel = Tunnel::new(
-                    core_settings.clone(),
-                    context.shutdown.clone(),
+                    context.clone(),
                     Box::new(HttpDownstream::new(
                         core_settings.clone(),
                         match protocol {
@@ -289,7 +299,7 @@ impl Core {
                             TunnelProtocol::Http3 => unreachable!(),
                         },
                     )),
-                    Self::make_forwarder(&context),
+                    Self::make_forwarder(context),
                     tunnel_id.clone(),
                 );
 
@@ -303,16 +313,24 @@ impl Core {
         }
     }
 
-    fn make_forwarder(context: &Context) -> Box<dyn Forwarder> {
-        match &context.core_settings.forward_protocol {
-            ForwardProtocolSettings::Direct(_) => Box::new(DirectForwarder::new(
-                context.core_settings.clone(),
-                context.icmp_forwarder.clone(),
-            )),
-            ForwardProtocolSettings::Socks5(_) => Box::new(Socks5Forwarder::new(
-                context.core_settings.clone(),
-                context.icmp_forwarder.clone(),
-            )),
+    fn make_forwarder(context: Arc<Context>) -> Box<dyn Forwarder> {
+        match &context.settings.forward_protocol {
+            ForwardProtocolSettings::Direct(_) => Box::new(DirectForwarder::new(context)),
+            ForwardProtocolSettings::Socks5(_) => Box::new(Socks5Forwarder::new(context)),
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for Context {
+    fn default() -> Self {
+        Self {
+            settings: Arc::new(Settings::default()),
+            icmp_forwarder: None,
+            shutdown: Shutdown::new(),
+            metrics: Metrics::new().unwrap(),
+            next_client_id: Default::default(),
+            next_tunnel_id: Default::default(),
         }
     }
 }

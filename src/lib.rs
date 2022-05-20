@@ -33,3 +33,4 @@ mod udp_pipe;
 mod icmp_utils;
 mod http_icmp_codec;
 mod icmp_forwarder;
+mod metrics;

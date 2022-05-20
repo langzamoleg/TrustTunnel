@@ -374,7 +374,7 @@ impl RawPacketStream {
                 return Err(io::Error::last_os_error());
             }
 
-            let socket = tokio::io::unix::AsyncFd::new(fd)
+            let socket = AsyncFd::new(fd)
                 .map_err(|e| { libc::close(fd); e })?;
 
             Ok(Self {

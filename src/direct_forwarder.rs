@@ -1,29 +1,27 @@
 use std::io;
 use std::sync::Arc;
-use crate::{datagram_pipe, downstream, forwarder, log_utils};
+use crate::{core, datagram_pipe, downstream, forwarder, log_utils};
 use crate::forwarder::Forwarder;
-use crate::icmp_forwarder::IcmpForwarder;
 use crate::net_utils::TcpDestination;
-use crate::settings::Settings;
 use crate::tcp_forwarder::TcpForwarder;
 use crate::udp_forwarder::UdpForwarder;
 
 
 pub(crate) struct DirectForwarder {
+    context: Arc<core::Context>,
     tcp_forwarder: TcpForwarder,
     udp_forwarder: UdpForwarder,
-    icmp_forwarder: Option<Arc<IcmpForwarder>>,
 }
 
 impl DirectForwarder {
     pub fn new(
-        core_settings: Arc<Settings>,
-        icmp_forwarder: Option<Arc<IcmpForwarder>>,
+        context: Arc<core::Context>,
     ) -> Self {
+        let settings = context.settings.clone();
         Self {
-            tcp_forwarder: TcpForwarder::new(core_settings.clone()),
-            udp_forwarder: UdpForwarder::new(core_settings),
-            icmp_forwarder,
+            context,
+            tcp_forwarder: TcpForwarder::new(settings.clone()),
+            udp_forwarder: UdpForwarder::new(settings),
         }
     }
 }
@@ -51,6 +49,6 @@ impl Forwarder for DirectForwarder {
         Box<dyn datagram_pipe::Source<Output = forwarder::IcmpDatagram>>,
         Box<dyn datagram_pipe::Sink<Input = downstream::IcmpDatagram>>,
     )> {
-        self.icmp_forwarder.as_ref().unwrap().make_multiplexer(id)
+        self.context.icmp_forwarder.as_ref().unwrap().make_multiplexer(id)
     }
 }

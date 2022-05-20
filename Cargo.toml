@@ -37,3 +37,4 @@ rust-crypto = "0.2.36"
 md4 = "0.10.1"
 des = "0.8.1"
 cached = "0.34.0"
+prometheus = { version = "0.13.0", features = ["process"] }

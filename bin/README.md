@@ -65,3 +65,13 @@ Skip it clicking `enter` if it does not matter.
                   of defence against malicious resources
 2) Set up the endpoint as an HTTPS proxy server in the browser (either via browser settings or 
 using an extension like `Proxy SwitchyOmega`)
+
+## Collecting metrics
+
+Common ways:
+
+* As plain text: send a GET request to `<ip>:<port>/metrics`, for example, using CURL
+or a web browser
+* Set up Prometheus:
+  1) Configure the instance to monitor the endpoint metrics (see [here](https://prometheus.io/docs/prometheus/latest/getting_started/#configure-prometheus-to-monitor-the-sample-targets))
+  2) Use [the graph interface](https://prometheus.io/docs/prometheus/latest/getting_started/#using-the-graphing-interface)

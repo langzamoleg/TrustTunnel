@@ -7,6 +7,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use crate::{datagram_pipe, http_codec, log_id, log_utils, pipe, utils};
+use crate::downstream_protocol_selector::TunnelProtocol;
 use crate::http_codec::{RequestHeaders, ResponseHeaders};
 use crate::settings::Settings;
 
@@ -233,7 +234,14 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> http_codec::HttpCodec for Http1C
     }
 
     async fn graceful_shutdown(&mut self) -> io::Result<()> {
+        if let Ok(Some(mut chunk)) = self.download_rx.try_recv() {
+            self.transport_stream.write_all_buf(&mut chunk).await?;
+        }
         self.transport_stream.shutdown().await
+    }
+
+    fn protocol(&self) -> TunnelProtocol {
+        TunnelProtocol::Http1
     }
 }
 

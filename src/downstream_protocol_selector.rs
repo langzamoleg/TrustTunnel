@@ -1,11 +1,10 @@
 use std::io;
 use std::io::ErrorKind;
-use std::sync::Arc;
 use crate::net_utils;
 use crate::settings::{ListenProtocolSettings, Settings};
 
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub(crate) enum TunnelProtocol {
     Http1,
     Http2,
@@ -36,7 +35,17 @@ impl DownstreamProtocol {
     }
 }
 
-pub(crate) fn select(settings: Arc<Settings>, alpn: Option<&str>, sni: &str) -> io::Result<DownstreamProtocol> {
+impl TunnelProtocol {
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Self::Http1 => "HTTP1",
+            Self::Http2 => "HTTP2",
+            Self::Http3 => "HTTP3",
+        }
+    }
+}
+
+pub(crate) fn select(settings: &Settings, alpn: Option<&str>, sni: &str) -> io::Result<DownstreamProtocol> {
     let proto = if Some(sni) == settings.service_messenger_tls_host_info.as_ref().map(|i| i.hostname.as_str()) {
         match alpn.unwrap_or_default() {
             net_utils::HTTP1_ALPN => Ok(DownstreamProtocol::ServiceMessenger(ServiceMessengerProtocol::Http1)),

@@ -41,7 +41,7 @@ pub(crate) enum DeserializeError {
     TimeExceededCode(u8),
 }
 
-pub(crate) type DeserializeResult<M> = std::result::Result<M, DeserializeError>;
+pub(crate) type DeserializeResult<M> = Result<M, DeserializeError>;
 
 impl Message {
     /// Serialize the message into the wire format
@@ -85,6 +85,14 @@ impl Message {
         match self {
             Message::V4(x) => x.code(),
             Message::V6(x) => x.code(),
+        }
+    }
+
+    /// Get the message on-the-wire length
+    pub fn len(&self) -> usize {
+        match self {
+            Message::V4(x) => x.len(),
+            Message::V6(x) => x.len(),
         }
     }
 }
@@ -170,6 +178,7 @@ macro_rules! deserialize_packet {
 
 pub(crate) mod v4 {
     use bytes::{Buf, Bytes};
+    use crate::icmp_utils::ICMP_MIN_COMMON_HEADER_SIZE;
     use crate::net_utils;
     use super::LengthCheck;
 
@@ -351,6 +360,23 @@ pub(crate) mod v4 {
             }
         }
 
+        pub fn len(&self) -> usize {
+            ICMP_MIN_COMMON_HEADER_SIZE
+                + match self {
+                    Message::DestinationUnreachable(x) => x.data.len(),
+                    Message::TimeExceeded(x) => x.data.len(),
+                    Message::ParameterProblem(x) => x.data.len(),
+                    Message::SourceQuench(x) => x.data.len(),
+                    Message::Redirect(x) => x.data.len(),
+                    Message::Echo(x) | Message::EchoReply(x) => x.data.len(),
+                    Message::Timestamp(x) | Message::TimestampReply(x) =>
+                        std::mem::size_of_val(&x.originate_timestamp)
+                            + std::mem::size_of_val(&x.receive_timestamp)
+                            + std::mem::size_of_val(&x.transmit_timestamp),
+                    Message::InformationRequest(_) | Message::InformationReply(_) => 0,
+                }
+        }
+
         pub fn responded_echo_request(&self) -> Option<super::Echo> {
             let icmp_data = match self {
                 Message::DestinationUnreachable(x) => Some(&x.data),
@@ -492,6 +518,7 @@ pub(crate) mod v4 {
 
 pub(crate) mod v6 {
     use bytes::{Buf, Bytes};
+    use crate::icmp_utils::ICMP_MIN_COMMON_HEADER_SIZE;
     use crate::net_utils;
     use super::LengthCheck;
 
@@ -613,6 +640,17 @@ pub(crate) mod v6 {
                 Message::ParameterProblem(x) => x.code,
                 Message::EchoRequest(x) | Message::EchoReply(x) => x.code,
             }
+        }
+
+        pub fn len(&self) -> usize {
+            ICMP_MIN_COMMON_HEADER_SIZE
+                + match self {
+                    Message::DestinationUnreachable(x) => x.data.len(),
+                    Message::PacketTooBig(x) => x.data.len(),
+                    Message::TimeExceeded(x) => x.data.len(),
+                    Message::ParameterProblem(x) => x.data.len(),
+                    Message::EchoRequest(x) | Message::EchoReply(x) => x.data.len(),
+                }
         }
 
         pub fn responded_echo_request(&self) -> Option<super::Echo> {

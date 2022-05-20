@@ -6,33 +6,36 @@ use async_trait::async_trait;
 use futures::future;
 use futures::future::Either;
 use tokio::time::Instant;
-use crate::{datagram_pipe, downstream, forwarder, log_id, log_utils, net_utils};
+use crate::{datagram_pipe, downstream, forwarder, log_id, log_utils, net_utils, pipe};
 
 
-pub(crate) struct DuplexPipe {
-    left_pipe: LeftPipe,
-    right_pipe: RightPipe,
+pub(crate) struct DuplexPipe<F: Send + Sync> {
+    left_pipe: LeftPipe<F>,
+    right_pipe: RightPipe<F>,
     timeout: Duration,
 }
 
 /// Forwards UDP packets from a client to a target host
-struct LeftPipe {
+struct LeftPipe<F: Send + Sync> {
     source: Box<dyn datagram_pipe::Source<Output = downstream::UdpDatagram>>,
     sink: Box<dyn datagram_pipe::Sink<Input = downstream::UdpDatagram>>,
-    shared: Arc<UdpPipeShared>,
+    shared: Arc<UdpPipeShared<F>>,
+    direction: pipe::SimplexDirection,
     next_connection_id: std::ops::RangeFrom<u64>,
 }
 
 /// Forwards UDP packets from a target host to a client
-struct RightPipe {
+struct RightPipe<F: Send + Sync> {
     source: Box<dyn datagram_pipe::Source<Output = forwarder::UdpDatagramReadStatus>>,
     sink: Box<dyn datagram_pipe::Sink<Input = forwarder::UdpDatagram>>,
-    shared: Arc<UdpPipeShared>,
+    shared: Arc<UdpPipeShared<F>>,
+    direction: pipe::SimplexDirection,
 }
 
-struct UdpPipeShared {
+struct UdpPipeShared<F: Send + Sync> {
     udp_connections: Mutex<HashMap<forwarder::UdpDatagramMeta, UdpConnection>>,
     forwarder_shared: Arc<dyn forwarder::UdpDatagramPipeShared>,
+    update_metrics: F,
 }
 
 struct UdpConnection {
@@ -52,7 +55,7 @@ enum UdpConnectionStatus {
 }
 
 
-impl LeftPipe {
+impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> LeftPipe<F> {
     async fn exchange(&mut self) -> io::Result<()> {
         loop {
             let datagram = self.source.read().await?;
@@ -66,8 +69,12 @@ impl LeftPipe {
                 continue;
             }
 
+            let datagram_len = datagram.payload.len();
             match self.sink.write(datagram).await? {
-                datagram_pipe::SendStatus::Sent => log_id!(debug, self.source.id(), "--> Datagram sent"),
+                datagram_pipe::SendStatus::Sent => {
+                    log_id!(debug, self.source.id(), "--> Datagram sent");
+                    (self.shared.update_metrics)(self.direction, datagram_len);
+                },
                 datagram_pipe::SendStatus::Dropped => log_id!(debug, self.source.id(), "--> Datagram dropped"),
             }
         }
@@ -104,7 +111,7 @@ impl LeftPipe {
     }
 }
 
-impl RightPipe {
+impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> RightPipe<F> {
     async fn exchange(&mut self) -> io::Result<()> {
         loop {
             let datagram = match { let x = self.source.read().await?; x } {
@@ -119,8 +126,11 @@ impl RightPipe {
             log_id!(trace, self.source.id(), "<-- Datagram: {:?}", datagram);
 
             let meta = datagram.meta;
+            let datagram_len = datagram.payload.len();
             match self.sink.write(datagram).await? {
-                datagram_pipe::SendStatus::Sent => (),
+                datagram_pipe::SendStatus::Sent => {
+                    (self.shared.update_metrics)(self.direction, datagram_len);
+                },
                 datagram_pipe::SendStatus::Dropped => log_id!(debug, self.source.id(), "<-- Datagram dropped"),
             }
 
@@ -168,7 +178,7 @@ impl UdpConnection {
     }
 }
 
-impl DuplexPipe {
+impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> DuplexPipe<F> {
     pub fn new(
         (source1, sink1): (
             Box<dyn datagram_pipe::Source<Output = downstream::UdpDatagram>>,
@@ -179,11 +189,13 @@ impl DuplexPipe {
             Box<dyn datagram_pipe::Source<Output = forwarder::UdpDatagramReadStatus>>,
             Box<dyn datagram_pipe::Sink<Input = downstream::UdpDatagram>>,
         ),
+        update_metrics: F,
         timeout: Duration,
     ) -> Self {
         let shared = Arc::new(UdpPipeShared {
             udp_connections: Mutex::new(Default::default()),
             forwarder_shared: shared2,
+            update_metrics,
         });
 
         Self {
@@ -191,12 +203,14 @@ impl DuplexPipe {
                 source: source1,
                 sink: sink2,
                 shared: shared.clone(),
+                direction: pipe::SimplexDirection::Outgoing,
                 next_connection_id: 0..,
             },
             right_pipe: RightPipe {
                 source: source2,
                 sink: sink1,
                 shared,
+                direction: pipe::SimplexDirection::Incoming
             },
             timeout,
         }
@@ -231,7 +245,7 @@ impl DuplexPipe {
 }
 
 #[async_trait]
-impl datagram_pipe::DuplexPipe for DuplexPipe {
+impl<F: Fn(pipe::SimplexDirection, usize) + Send + Sync> datagram_pipe::DuplexPipe for DuplexPipe<F> {
     async fn exchange(&mut self) -> io::Result<()> {
         loop {
             match tokio::time::timeout(self.timeout / 4, self.exchange_once()).await {

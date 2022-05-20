@@ -574,7 +574,7 @@ impl QuicSocket {
                 bytes.truncate(n);
                 Some(bytes.freeze())
             }
-            Err(quiche::h3::Error::Done) => None,
+            Err(h3::Error::Done) => None,
             Err(e) => return Err(io::Error::new(ErrorKind::Other,e.to_string())),
         };
 

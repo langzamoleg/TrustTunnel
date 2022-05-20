@@ -63,7 +63,7 @@ pub(crate) trait Sink: Send {
 }
 
 #[derive(Copy, Clone, PartialEq)]
-pub(crate) enum SimplexPipeDirection {
+pub(crate) enum SimplexDirection {
     /// Packet goes from a peer to a client
     Incoming,
     /// Packet goes from a client to a peer
@@ -71,11 +71,12 @@ pub(crate) enum SimplexPipeDirection {
 }
 
 /// Feeds packets received from [`Source`] to [`Sink`] doing some flow control
-pub(crate) struct SimplexPipe {
+pub(crate) struct SimplexPipe<F> {
     source: Box<dyn Source>,
     sink: Box<dyn Sink>,
+    update_metrics: F,
     pending_chunk: Option<Data>,
-    direction: SimplexPipeDirection,
+    direction: SimplexDirection,
     last_activity: Instant,
 }
 
@@ -94,24 +95,26 @@ impl Display for Data {
     }
 }
 
-impl Display for SimplexPipeDirection {
+impl Display for SimplexDirection {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
-            SimplexPipeDirection::Incoming => write!(f, "<--"),
-            SimplexPipeDirection::Outgoing => write!(f, "-->"),
+            SimplexDirection::Incoming => write!(f, "<--"),
+            SimplexDirection::Outgoing => write!(f, "-->"),
         }
     }
 }
 
-impl SimplexPipe {
+impl<F: Fn(SimplexDirection, usize) + Send> SimplexPipe<F> {
     pub fn new(
         source: Box<dyn Source>,
         sink: Box<dyn Sink>,
-        direction: SimplexPipeDirection,
+        update_metrics: F,
+        direction: SimplexDirection,
     ) -> Self {
         Self {
             source,
             sink,
+            update_metrics,
             pending_chunk: Default::default(),
             direction,
             last_activity: Instant::now(),
@@ -145,7 +148,9 @@ impl SimplexPipe {
                     let data_len = bytes.len();
                     let unsent_data = self.sink.write(bytes)
                         .map_err(|e| io_to_pipe_error(id, e))?;
-                    self.source.consume(data_len - unsent_data.len())
+                    let sent = data_len - unsent_data.len();
+                    (self.update_metrics)(self.direction, sent);
+                    self.source.consume(sent)
                         .map_err(|e| io_to_pipe_error(id, e))?;
                     if !unsent_data.is_empty() {
                         log_dir!(trace, self.source.id(), self.direction, "Unsent: {} bytes", unsent_data.len());
@@ -160,19 +165,20 @@ impl SimplexPipe {
     }
 }
 
-pub(crate) struct DuplexPipe {
-    left_pipe: SimplexPipe,
-    right_pipe: SimplexPipe,
+pub(crate) struct DuplexPipe<F> {
+    left_pipe: SimplexPipe<F>,
+    right_pipe: SimplexPipe<F>,
 }
 
-impl DuplexPipe {
+impl<F: Fn(SimplexDirection, usize) + Send + Clone> DuplexPipe<F> {
     pub fn new(
-        left_pipe: SimplexPipe,
-        right_pipe: SimplexPipe,
+        (dir1, source1, sink1): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
+        (dir2, source2, sink2): (SimplexDirection, Box<dyn Source>, Box<dyn Sink>),
+        update_metrics: F,
     ) -> Self {
         Self {
-            left_pipe,
-            right_pipe,
+            left_pipe: SimplexPipe::new(source1, sink1, update_metrics.clone(), dir1),
+            right_pipe: SimplexPipe::new(source2, sink2, update_metrics, dir2),
         }
     }
 

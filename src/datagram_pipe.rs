@@ -5,6 +5,11 @@ use futures::future;
 use crate::{log_id, log_utils, pipe};
 
 
+pub(crate) trait Datagram {
+    /// Get on-the-wire length of the datagram
+    fn len(&self) -> usize;
+}
+
 /// An abstract interface for a datagram receiver implementation
 #[async_trait]
 pub(crate) trait Source: Send {
@@ -45,31 +50,43 @@ pub(crate) trait DuplexPipe: Send {
     async fn exchange(&mut self) -> io::Result<()>;
 }
 
-pub(crate) struct GenericSimplexPipe<D: Debug> {
-    direction: pipe::SimplexPipeDirection,
+pub(crate) struct GenericSimplexPipe<D, F> {
+    direction: pipe::SimplexDirection,
     source: Box<dyn Source<Output = D>>,
     sink: Box<dyn Sink<Input = D>>,
+    update_metrics: F,
 }
 
-pub(crate) struct GenericDuplexPipe<D1: Debug, D2: Debug> {
-    left_pipe: GenericSimplexPipe<D1>,
-    right_pipe: GenericSimplexPipe<D2>,
+pub(crate) struct GenericDuplexPipe<D1, D2, F> {
+    left_pipe: GenericSimplexPipe<D1, F>,
+    right_pipe: GenericSimplexPipe<D2, F>,
 }
 
-impl<D1: Debug, D2: Debug> GenericDuplexPipe<D1, D2> {
+impl<D1, D2, F> GenericDuplexPipe<D1, D2, F>
+    where
+        D1: Datagram + Debug,
+        D2: Datagram + Debug,
+        F: Fn(pipe::SimplexDirection, usize) + Send + Clone,
+{
     pub fn new(
-        left_pipe: GenericSimplexPipe<D1>,
-        right_pipe: GenericSimplexPipe<D2>,
+        (dir1, source1, sink1): (pipe::SimplexDirection, Box<dyn Source<Output = D1>>, Box<dyn Sink<Input = D1>>),
+        (dir2, source2, sink2): (pipe::SimplexDirection, Box<dyn Source<Output = D2>>, Box<dyn Sink<Input = D2>>),
+        update_metrics: F,
     ) -> Self {
         Self {
-            left_pipe,
-            right_pipe,
+            left_pipe: GenericSimplexPipe::new(dir1, source1, sink1, update_metrics.clone()),
+            right_pipe: GenericSimplexPipe::new(dir2, source2, sink2, update_metrics),
         }
     }
 }
 
 #[async_trait]
-impl<D1: Send + Debug, D2: Send + Debug> DuplexPipe for GenericDuplexPipe<D1, D2> {
+impl<D1, D2, F> DuplexPipe for GenericDuplexPipe<D1, D2, F>
+    where
+        D1: Datagram + Send + Debug,
+        D2: Datagram + Send + Debug,
+        F: Fn(pipe::SimplexDirection, usize) + Send,
+{
     async fn exchange(&mut self) -> io::Result<()> {
         let left = self.left_pipe.exchange();
         futures::pin_mut!(left);
@@ -82,16 +99,18 @@ impl<D1: Send + Debug, D2: Send + Debug> DuplexPipe for GenericDuplexPipe<D1, D2
     }
 }
 
-impl<D: Debug> GenericSimplexPipe<D> {
+impl<D: Datagram + Debug, F: Fn(pipe::SimplexDirection, usize) + Send> GenericSimplexPipe<D, F> {
     pub fn new(
-        direction: pipe::SimplexPipeDirection,
+        direction: pipe::SimplexDirection,
         source: Box<dyn Source<Output = D>>,
         sink: Box<dyn Sink<Input = D>>,
+        update_metrics: F,
     ) -> Self {
         Self {
             direction,
             source,
             sink,
+            update_metrics,
         }
     }
 
@@ -100,8 +119,12 @@ impl<D: Debug> GenericSimplexPipe<D> {
             let datagram = self.source.read().await?;
             log_id!(trace, self.source.id(), "{} Datagram: {:?}", self.direction, datagram);
 
+            let datagram_len = datagram.len();
             match self.sink.write(datagram).await? {
-                SendStatus::Sent => log_id!(debug, self.source.id(), "{} Datagram sent", self.direction),
+                SendStatus::Sent => {
+                    log_id!(debug, self.source.id(), "{} Datagram sent", self.direction);
+                    (self.update_metrics)(self.direction, datagram_len);
+                }
                 SendStatus::Dropped => log_id!(debug, self.source.id(), "{} Datagram dropped", self.direction),
             }
         }

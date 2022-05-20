@@ -105,3 +105,9 @@ impl Debug for UdpDatagram {
         write!(f, "meta={:?}, payload={}B", self.meta, self.payload.len())
     }
 }
+
+impl datagram_pipe::Datagram for IcmpDatagram {
+    fn len(&self) -> usize {
+        self.message.len()
+    }
+}

@@ -5,22 +5,18 @@ use std::net::SocketAddr;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use async_socks5::AddrKind;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use crate::forwarder::Forwarder;
-use crate::{datagram_pipe, downstream, forwarder, log_id, log_utils, net_utils, pipe};
-use crate::icmp_forwarder::IcmpForwarder;
-use crate::net_utils::TcpDestination;
+use crate::{core, datagram_pipe, downstream, forwarder, log_id, log_utils, net_utils, pipe};
 use crate::settings::{ForwardProtocolSettings, Settings};
 use crate::tcp_forwarder::TcpForwarder;
 
 
 pub(crate) struct Socks5Forwarder {
-    core_settings: Arc<Settings>,
-    icmp_forwarder: Option<Arc<IcmpForwarder>>,
+    context: Arc<core::Context>,
 }
 
 struct TcpConnector {
@@ -62,13 +58,9 @@ struct SocketError {
 
 
 impl Socks5Forwarder {
-    pub fn new(
-        core_settings: Arc<Settings>,
-        icmp_forwarder: Option<Arc<IcmpForwarder>>,
-    ) -> Self {
+    pub fn new(context: Arc<core::Context>) -> Self {
         Self {
-            core_settings: core_settings.clone(),
-            icmp_forwarder,
+            context
         }
     }
 }
@@ -89,7 +81,7 @@ impl forwarder::UdpDatagramPipeShared for DatagramTransceiverShared {
                 TcpStream::connect(server_address).await?,
                 UdpSocket::from_std(net_utils::make_udp_socket(server_address.is_ipv4())?)?,
                 None,
-                None::<AddrKind>,
+                None::<async_socks5::AddrKind>,
             ).await.map_err(socks_to_io_error)?
         );
 
@@ -128,7 +120,7 @@ impl Forwarder for Socks5Forwarder {
         &mut self, id: log_utils::IdChain<u64>, destination: net_utils::TcpDestination
     ) -> io::Result<Box<dyn forwarder::TcpConnector>> {
         Ok(Box::new(TcpConnector {
-            core_settings: self.core_settings.clone(),
+            core_settings: self.context.settings.clone(),
             destination,
             id,
         }))
@@ -143,7 +135,7 @@ impl Forwarder for Socks5Forwarder {
     )> {
         let (tx, rx) = mpsc::channel(1);
         let shared = Arc::new(DatagramTransceiverShared {
-            core_settings: self.core_settings.clone(),
+            core_settings: self.context.settings.clone(),
             associations: Default::default(),
             new_socket_tx: tx,
             id,
@@ -169,7 +161,7 @@ impl Forwarder for Socks5Forwarder {
             Box<dyn datagram_pipe::Sink<Input = downstream::IcmpDatagram>>,
         )>
     {
-        self.icmp_forwarder.as_ref().unwrap().make_multiplexer(id)
+        self.context.icmp_forwarder.as_ref().unwrap().make_multiplexer(id)
     }
 }
 
@@ -329,10 +321,10 @@ impl datagram_pipe::Sink for DatagramSink {
 }
 
 impl Into<async_socks5::AddrKind> for net_utils::TcpDestination {
-    fn into(self) -> AddrKind {
+    fn into(self) -> async_socks5::AddrKind {
         match self {
-            TcpDestination::Address(x) => async_socks5::AddrKind::Ip(x),
-            TcpDestination::HostName(x) => async_socks5::AddrKind::Domain(x.0, x.1),
+            net_utils::TcpDestination::Address(x) => async_socks5::AddrKind::Ip(x),
+            net_utils::TcpDestination::HostName(x) => async_socks5::AddrKind::Domain(x.0, x.1),
         }
     }
 }

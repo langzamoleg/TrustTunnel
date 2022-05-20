@@ -40,6 +40,12 @@ impl<T: Copy + serde::ser::Serialize> IdItem<T> {
 }
 
 impl<T: Copy + serde::ser::Serialize> IdChain<T> {
+    pub fn empty() -> Self {
+        Self {
+            list: Default::default(),
+        }
+    }
+
     pub fn extended(&self, new: IdItem<T>) -> Self {
         let mut x = Self::with_capacity(self.list.len() + 1);
         x.list.extend(self.list.iter());
