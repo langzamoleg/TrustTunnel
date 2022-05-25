@@ -4,8 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::{TcpListener, UdpSocket};
 use crate::direct_forwarder::DirectForwarder;
-use crate::{downstream_protocol_selector, http_ping_handler, log_id, log_utils, metrics, utils};
-use crate::downstream_protocol_selector::{DownstreamProtocol, PingProtocol, ServiceMessengerProtocol, TunnelProtocol};
+use crate::{authentication, http_ping_handler, log_id, log_utils, metrics, protocol_selector, utils};
+use crate::protocol_selector::{Protocol, PingProtocol, ServiceMessengerProtocol, TunnelProtocol};
 use crate::forwarder::Forwarder;
 use crate::http1_codec::Http1Codec;
 use crate::http2_codec::Http2Codec;
@@ -234,10 +234,10 @@ impl Core {
 
         let core_settings = context.settings.clone();
         let proto =
-            match downstream_protocol_selector::select(&core_settings, alpn.as_deref(), &sni) {
-                Ok(DownstreamProtocol::Tunnel(TunnelProtocol::Http3))
-                | Ok(DownstreamProtocol::Ping(PingProtocol::Http3))
-                | Ok(DownstreamProtocol::ServiceMessenger(ServiceMessengerProtocol::Http3))
+            match protocol_selector::select(&core_settings, alpn.as_deref(), &sni) {
+                Ok(Protocol::Tunnel(TunnelProtocol::Http3))
+                | Ok(Protocol::Ping(PingProtocol::Http3))
+                | Ok(Protocol::ServiceMessenger(ServiceMessengerProtocol::Http3))
                 => {
                     log_id!(debug, client_id, "Unexpected connection protocol - dropping tunnel");
                     return;
@@ -250,7 +250,7 @@ impl Core {
             };
         log_id!(trace, client_id, "Selected protocol: {:?}", proto);
 
-        let stream = match acceptor.accept(proto.as_alpn().as_bytes().to_vec(), &client_id).await {
+        let stream = match acceptor.accept(proto, &client_id).await {
             Ok(s) => {
                 log_id!(debug, client_id, "New TLS client: {:?}", s);
                 s
@@ -262,7 +262,7 @@ impl Core {
         };
 
         match proto {
-            DownstreamProtocol::Tunnel(protocol) => {
+            Protocol::Tunnel(protocol) => {
                 let tunnel_id = client_id.extended(log_utils::IdItem::new(
                     log_utils::TUNNEL_ID_FMT, context.next_tunnel_id.fetch_add(1, Ordering::Relaxed)
                 ));
@@ -279,10 +279,11 @@ impl Core {
                         )),
                         TunnelProtocol::Http3 => unreachable!(),
                     },
+                    &sni,
                     tunnel_id,
                 ).await
             }
-            DownstreamProtocol::Ping(protocol) => http_ping_handler::listen(
+            Protocol::Ping(protocol) => http_ping_handler::listen(
                 match protocol {
                     PingProtocol::Http1 => Box::new(Http1Codec::new(
                         core_settings, stream, client_id.clone(),
@@ -294,7 +295,7 @@ impl Core {
                 },
                 client_id,
             ).await,
-            DownstreamProtocol::ServiceMessenger(_) => { todo!() }
+            Protocol::ServiceMessenger(_) => { todo!() }
         }
     }
 
@@ -314,11 +315,12 @@ impl Core {
             }
         };
 
+        let sni = socket.server_name().unwrap_or_default();
         let proto =
-            match downstream_protocol_selector::select(&core_settings, Some(&alpn), &socket.server_name().unwrap_or_default()) {
-                Ok(x) if x == DownstreamProtocol::Tunnel(TunnelProtocol::Http3)
-                    || x == DownstreamProtocol::Ping(PingProtocol::Http3)
-                    || x == DownstreamProtocol::ServiceMessenger(ServiceMessengerProtocol::Http3)
+            match protocol_selector::select(&core_settings, Some(&alpn), &sni) {
+                Ok(x) if x == Protocol::Tunnel(TunnelProtocol::Http3)
+                    || x == Protocol::Ping(PingProtocol::Http3)
+                    || x == Protocol::ServiceMessenger(ServiceMessengerProtocol::Http3)
                 => x,
                 Ok(x) => {
                     log_id!(debug, client_id, "Unexpected connection protocol ({:?}) - dropping tunnel", x);
@@ -332,7 +334,7 @@ impl Core {
         log_id!(trace, client_id, "Selected protocol: {:?}", proto);
 
         match proto {
-            DownstreamProtocol::Tunnel(protocol) => {
+            Protocol::Tunnel(protocol) => {
                 let tunnel_id = client_id.extended(log_utils::IdItem::new(
                     log_utils::TUNNEL_ID_FMT, context.next_tunnel_id.fetch_add(1, Ordering::Relaxed)
                 ));
@@ -341,14 +343,15 @@ impl Core {
                     context,
                     protocol,
                     Box::new(Http3Codec::new(socket, tunnel_id.clone())),
+                    &sni,
                     tunnel_id,
                 ).await
             }
-            DownstreamProtocol::Ping(_) => http_ping_handler::listen(
+            Protocol::Ping(_) => http_ping_handler::listen(
                 Box::new(Http3Codec::new(socket, client_id.clone())),
                 client_id,
             ).await,
-            DownstreamProtocol::ServiceMessenger(_) => { todo!() }
+            Protocol::ServiceMessenger(_) => { todo!() }
         }
     }
 
@@ -356,15 +359,29 @@ impl Core {
         context: Arc<Context>,
         protocol: TunnelProtocol,
         codec: Box<dyn HttpCodec>,
+        server_name: &str,
         tunnel_id: log_utils::IdChain<u64>,
     ) {
         let _metrics_guard = Metrics::client_sessions_counter(context.metrics.clone(), protocol);
+
+        let authenticated = server_name != context.settings.tunnel_tls_host_info.hostname
+            && match context.settings.authenticator.authenticate(
+                utils::scan_sni_authentication(server_name, &context.settings.tunnel_tls_host_info.hostname).unwrap(),
+                &tunnel_id
+            ).await {
+                authentication::Status::Pass => true,
+                authentication::Status::Reject => {
+                    log_id!(debug, tunnel_id, "SNI authentication failed");
+                    return;
+                }
+            };
 
         log_id!(debug, tunnel_id, "New tunnel for client");
         let mut tunnel = Tunnel::new(
             context.clone(),
             Box::new(HttpDownstream::new(context.settings.clone(), codec)),
             Self::make_forwarder(context),
+            authenticated,
             tunnel_id.clone(),
         );
 

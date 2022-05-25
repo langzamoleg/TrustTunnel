@@ -13,6 +13,7 @@ pub(crate) struct Tunnel {
     context: Arc<core::Context>,
     downstream: Box<dyn Downstream>,
     forwarder: Arc<Mutex<Box<dyn Forwarder>>>,
+    authenticated: bool,
     id: log_utils::IdChain<u64>,
 }
 
@@ -22,12 +23,14 @@ impl Tunnel {
         context: Arc<core::Context>,
         downstream: Box<dyn Downstream>,
         forwarder: Box<dyn Forwarder>,
+        authenticated: bool,
         id: log_utils::IdChain<u64>,
     ) -> Self {
         Self {
             context,
             downstream,
             forwarder: Arc::new(Mutex::new(forwarder)),
+            authenticated,
             id,
         }
     }
@@ -65,6 +68,7 @@ impl Tunnel {
             let context = self.context.clone();
             let forwarder = self.forwarder.clone();
             let request_id = request.id();
+            let authenticated = self.authenticated;
             let log_id = self.id.clone();
             let update_metrics = {
                 let metrics = context.metrics.clone();
@@ -87,10 +91,19 @@ impl Tunnel {
                     }
                 };
 
-                match context.settings.authenticator.authenticate(info, &log_id).await {
-                    Status::Pass => (),
-                    Status::Reject => {
-                        log_id!(debug, request_id, "Authorization failed");
+                match info {
+                    Some(source) =>
+                        match context.settings.authenticator.authenticate(source, &log_id).await {
+                            Status::Pass => (),
+                            Status::Reject => {
+                                log_id!(debug, request_id, "Authentication failed");
+                                request.fail_request();
+                                return;
+                            }
+                        },
+                    None if authenticated => (),
+                    None => {
+                        log_id!(debug, request_id, "Got request without authentication info on non-authenticated connection");
                         request.fail_request();
                         return;
                     }

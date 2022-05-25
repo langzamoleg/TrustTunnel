@@ -7,7 +7,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use crate::{datagram_pipe, http_codec, log_id, log_utils, pipe, utils};
-use crate::downstream_protocol_selector::TunnelProtocol;
+use crate::protocol_selector::TunnelProtocol;
 use crate::http_codec::{RequestHeaders, ResponseHeaders};
 use crate::settings::Settings;
 

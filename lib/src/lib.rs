@@ -9,7 +9,7 @@ pub mod shutdown;
 
 mod direct_forwarder;
 mod downstream;
-mod downstream_protocol_selector;
+mod protocol_selector;
 mod forwarder;
 mod http_downstream;
 mod http_codec;

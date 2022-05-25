@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use crate::{datagram_pipe, http_codec, log_id, log_utils, net_utils, pipe};
-use crate::downstream_protocol_selector::TunnelProtocol;
+use crate::protocol_selector::TunnelProtocol;
 use crate::http_codec::{HttpCodec, RequestHeaders, ResponseHeaders};
 use crate::quic_multiplexer::{QuicSocket, QuicSocketEvent};
 

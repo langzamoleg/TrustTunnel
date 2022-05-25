@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{Response, StatusCode};
 use http::uri::Authority;
 use crate::{authentication, datagram_pipe, log_utils, pipe};
-use crate::downstream_protocol_selector::TunnelProtocol;
+use crate::protocol_selector::TunnelProtocol;
 
 
 pub(crate) type RequestHeaders = http::request::Parts;
@@ -47,12 +47,16 @@ pub(crate) trait PendingRequest: Send {
     }
 
     /// Get the authorization info if some
-    fn auth_info(&self) -> io::Result<authentication::Source> {
-        self.request().headers
-            .get("proxy-authorization")
-            .and_then(|h| h.to_str().ok())
+    fn auth_info(&self) -> io::Result<Option<authentication::Source>> {
+        let header = match self.request().headers.get("proxy-authorization") {
+            None => return Ok(None),
+            Some(x) => x,
+        };
+
+        header.to_str()
+            .ok()
             .and_then(|s| s.strip_prefix("Basic "))
-            .map(|s| authentication::Source::ProxyBasic(s.into()))
+            .map(|s| Some(authentication::Source::ProxyBasic(s.into())))
             .ok_or_else(|| io::Error::new(
                 ErrorKind::Other,
                 format!("Unexpected authorization header: {:?}", self.request())

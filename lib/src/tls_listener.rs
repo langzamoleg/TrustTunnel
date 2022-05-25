@@ -5,7 +5,8 @@ use rustls::ServerConfig;
 use tokio::net::TcpStream;
 use tokio_rustls::{LazyConfigAcceptor, StartHandshake};
 use tokio_rustls::server::TlsStream;
-use crate::{authentication, log_utils, utils};
+use crate::{log_utils, utils};
+use crate::protocol_selector::Protocol;
 use crate::settings::Settings;
 
 
@@ -49,38 +50,38 @@ impl TlsAcceptor {
             .map(Vec::from)
     }
 
-    pub async fn accept(self, alpn: Vec<u8>, log_id: &log_utils::IdChain<u64>) -> io::Result<TlsStream<TcpStream>> {
+    pub async fn accept(self, protocol: Protocol, _log_id: &log_utils::IdChain<u64>) -> io::Result<TlsStream<TcpStream>> {
         let settings = &self.core_settings;
         let tunnel_tls_info = &settings.tunnel_tls_host_info;
         let ping_tls_info = settings.ping_tls_host_info.as_ref();
         let sm_tls_info = settings.service_messenger_tls_host_info.as_ref();
 
-        let (cert_file, key_file) = match self.inner.client_hello().server_name() {
-            Some(x) if x == tunnel_tls_info.hostname => (
-                &tunnel_tls_info.cert_chain_path,
-                &tunnel_tls_info.private_key_path,
-            ),
-            Some(x) if Some(x) == ping_tls_info.map(|info| info.hostname.as_str()) => (
+        let (cert_file, key_file) = match protocol {
+            Protocol::Ping(_) => (
                 &ping_tls_info.unwrap().cert_chain_path,
                 &ping_tls_info.unwrap().private_key_path,
             ),
-            Some(x) if Some(x) == sm_tls_info.map(|info| info.hostname.as_str()) => (
+            Protocol::ServiceMessenger(_) => (
                 &sm_tls_info.unwrap().cert_chain_path,
                 &sm_tls_info.unwrap().private_key_path,
             ),
-            x => match x.and_then(|x| utils::scan_sni_authentication(x, &tunnel_tls_info.hostname)) {
-                None => return Err(io::Error::new(
-                    ErrorKind::Other, format!("Unexpected server name in client hello: {:?}", x)
+            Protocol::Tunnel(_) => match self.inner.client_hello().server_name() {
+                None => return Err(io::Error::new(ErrorKind::Other, "Client hello has no SNI")),
+                Some(x) if x == tunnel_tls_info.hostname => (
+                    &tunnel_tls_info.cert_chain_path,
+                    &tunnel_tls_info.private_key_path,
+                ),
+                // For the SNI authentication later in tunnel
+                Some(x) if x.strip_suffix(&tunnel_tls_info.hostname)
+                    .and_then(|x| x.strip_suffix('.'))
+                    .is_some()
+                => (
+                    &tunnel_tls_info.cert_chain_path,
+                    &tunnel_tls_info.private_key_path,
+                ),
+                Some(x) => return Err(io::Error::new(
+                    ErrorKind::Other, format!("Unexpected server name in client hello: {}", x)
                 )),
-                Some(source) => match settings.authenticator.authenticate(source, log_id).await {
-                    authentication::Status::Pass => (
-                        &tunnel_tls_info.cert_chain_path,
-                        &tunnel_tls_info.private_key_path,
-                    ),
-                    authentication::Status::Reject => return Err(io::Error::new(
-                        ErrorKind::Other, "SNI authentication failed"
-                    )),
-                }
             }
         };
 
@@ -93,7 +94,7 @@ impl TlsAcceptor {
                     ErrorKind::Other, format!("Failed to create TLS configuration: {}", e))
                 )?;
 
-            cfg.alpn_protocols = vec![alpn];
+            cfg.alpn_protocols = vec![protocol.as_alpn().as_bytes().to_vec()];
             Arc::new(cfg)
         };
 
