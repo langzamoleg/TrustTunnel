@@ -6,7 +6,7 @@ use bytes::Bytes;
 use prometheus::Encoder;
 use tokio::net::{TcpListener, TcpStream};
 use crate::{core, http_codec, log_id, log_utils};
-use crate::protocol_selector::TunnelProtocol;
+use crate::protocol_selector::Protocol;
 use crate::http1_codec::Http1Codec;
 use crate::http_codec::HttpCodec;
 
@@ -24,7 +24,7 @@ pub(crate) struct Metrics {
 
 pub(crate) struct ClientSessionsCounter {
     metrics: Arc<Metrics>,
-    protocol: TunnelProtocol,
+    protocol: Protocol,
 }
 
 
@@ -49,15 +49,15 @@ impl Metrics {
         }))
     }
 
-    pub fn client_sessions_counter(self: Arc<Self>, protocol: TunnelProtocol) -> ClientSessionsCounter {
+    pub fn client_sessions_counter(self: Arc<Self>, protocol: Protocol) -> ClientSessionsCounter {
         ClientSessionsCounter::new(self, protocol)
     }
 
-    pub fn add_inbound_bytes(&self, protocol: TunnelProtocol, n: usize) {
+    pub fn add_inbound_bytes(&self, protocol: Protocol, n: usize) {
         self.inbound_traffic.with_label_values(&[protocol.to_str()]).inc_by(n as u64);
     }
 
-    pub fn add_outbound_bytes(&self, protocol: TunnelProtocol, n: usize) {
+    pub fn add_outbound_bytes(&self, protocol: Protocol, n: usize) {
         self.outbound_traffic.with_label_values(&[protocol.to_str()]).inc_by(n as u64);
     }
 
@@ -73,7 +73,7 @@ impl Metrics {
 }
 
 impl ClientSessionsCounter {
-    fn new(metrics: Arc<Metrics>, protocol: TunnelProtocol) -> Self {
+    fn new(metrics: Arc<Metrics>, protocol: Protocol) -> Self {
         metrics.client_sessions.with_label_values(&[protocol.to_str()]).inc();
 
         Self {

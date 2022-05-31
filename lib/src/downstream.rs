@@ -4,7 +4,7 @@ use std::net::{IpAddr, SocketAddr};
 use async_trait::async_trait;
 use bytes::Bytes;
 use crate::{authentication, datagram_pipe, forwarder, icmp_utils, log_utils, pipe};
-use crate::protocol_selector::TunnelProtocol;
+use crate::protocol_selector::Protocol;
 use crate::net_utils::TcpDestination;
 
 
@@ -93,7 +93,7 @@ pub(crate) trait Downstream: Send {
     async fn graceful_shutdown(&mut self) -> io::Result<()>;
 
     /// Get the downstream protocol
-    fn protocol(&self) -> TunnelProtocol;
+    fn protocol(&self) -> Protocol;
 }
 
 impl Debug for UdpDatagram {

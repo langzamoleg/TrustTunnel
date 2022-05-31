@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 use crate::{datagram_pipe, http_codec, log_id, log_utils, net_utils, pipe};
-use crate::protocol_selector::TunnelProtocol;
+use crate::protocol_selector::Protocol;
 use crate::http_codec::{HttpCodec, RequestHeaders, ResponseHeaders};
 use crate::quic_multiplexer::{QuicSocket, QuicSocketEvent};
 
@@ -268,8 +268,8 @@ impl HttpCodec for Http3Codec {
         self.socket.graceful_shutdown()
     }
 
-    fn protocol(&self) -> TunnelProtocol {
-        TunnelProtocol::Http3
+    fn protocol(&self) -> Protocol {
+        Protocol::Http3
     }
 }
 

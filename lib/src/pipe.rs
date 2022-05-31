@@ -54,6 +54,16 @@ pub(crate) trait Sink: Send {
     /// An unsent portion of `data` due to flow control limits. It must be sent later by a caller.
     fn write(&mut self, data: Bytes) -> io::Result<Bytes>;
 
+    /// Convenient helper to write the full chunk in one line
+    async fn write_all(&mut self, mut data: Bytes) -> io::Result<()> {
+        while !data.is_empty() {
+            self.wait_writable().await?;
+            data = self.write(data)?;
+        }
+
+        Ok(())
+    }
+
     /// Indicate that no more data will be sent to the sink
     fn eof(&mut self) -> io::Result<()>;
 

@@ -35,3 +35,4 @@ mod http_icmp_codec;
 mod icmp_forwarder;
 mod metrics;
 mod http_ping_handler;
+mod reverse_proxy;

@@ -25,16 +25,22 @@ pub struct Settings {
     pub(crate) listen_address: SocketAddr,
     /// The TLS host info for traffic tunneling
     pub(crate) tunnel_tls_host_info: TlsHostInfo,
+    // @todo: check uniqueness when parsing from json
     /// The TLS host info for HTTPS pinging.
     /// With this one set up the endpoint will respond with `200 OK` to HTTPS `GET` requests
     /// to the specified domain.
-    /// The host name MUST differ from the tunneling host and service messanger ones.
+    /// The host name MUST differ from the tunneling host and reverse proxy ones.
     pub(crate) ping_tls_host_info: Option<TlsHostInfo>,
-    /// The TLS host info of service messenger.
-    /// With this one set up the endpoint will accept TLS connections to the specified host name
-    /// and todo...
-    /// The host name MUST differ from the tunneling host and HTTPS pinging ones.
-    pub(crate) service_messenger_tls_host_info: Option<TlsHostInfo>,
+    /// The reverse proxy settings.
+    /// With this one set up the endpoint does TLS termination on such connections and
+    /// translates HTTP/x traffic into HTTP/1.1 protocol towards the server and back
+    /// into original HTTP/x towards the client. Like this:
+    ///
+    /// ```(client) TLS(HTTP/x) <--(endpoint)--> (server) HTTP/1.1```
+    ///
+    /// The translated HTTP/1.1 requests have the custom header `X-Original-Protocol`
+    /// appended. For now, its value can be either `HTTP1`, or `HTTP3`.
+    pub(crate) reverse_proxy: Option<ReverseProxySettings>,
     /// IPv6 availability
     #[serde(default = "Settings::default_ipv6_available")]
     pub(crate) ipv6_available: bool,
@@ -86,6 +92,25 @@ pub struct TlsHostInfo {
     /// May be equal to `cert_chain_path` if it contains both of them.
     #[serde(deserialize_with = "deserialize_file_path")]
     pub private_key_path: String,
+}
+
+#[derive(Deserialize)]
+pub struct ReverseProxySettings {
+    /// The origin server address
+    pub server_address: SocketAddr,
+    /// The TLS host info.
+    /// The host name MUST differ from the tunneling host and HTTPS pinging ones.
+    pub tls_info: TlsHostInfo,
+    /// The connection timeout
+    #[serde(default = "Settings::default_tcp_connections_timeout")]
+    #[serde(rename(deserialize = "connection_timeout_secs"))]
+    #[serde(deserialize_with = "deserialize_duration_secs")]
+    pub connection_timeout: Duration,
+    /// With this one set to `true` the endpoint overrides the HTTP method while
+    /// translating an HTTP3 request to HTTP1 in case the request has the `GET` method
+    /// and its path is `/`
+    #[serde(default)]
+    pub h3_backward_compatibility: bool,
 }
 
 #[derive(Deserialize)]
@@ -291,8 +316,8 @@ pub enum BuilderError {
     TunnelTlsHostInfo(String),
     /// Invalid [`Settings.ping_tls_host_info`]
     PingTlsHostInfo(String),
-    /// Invalid [`Settings.service_messenger_tls_host_info`]
-    ServiceMessengerTlsHostInfo(String),
+    /// Invalid [`Settings.reverse_proxy`]
+    ReverseProxy(String),
     /// [`Settings.listen_protocols`] are not set
     ListenProtocols,
     /// Invalid authentication info
@@ -351,7 +376,7 @@ impl Default for Settings {
             listen_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             tunnel_tls_host_info: Default::default(),
             ping_tls_host_info: None,
-            service_messenger_tls_host_info: None,
+            reverse_proxy: None,
             ipv6_available: false,
             tls_handshake_timeout: Default::default(),
             client_listener_timeout: Default::default(),
@@ -529,7 +554,7 @@ impl SettingsBuilder {
                 listen_address: Settings::default_listen_address(),
                 tunnel_tls_host_info: Default::default(),
                 ping_tls_host_info: None,
-                service_messenger_tls_host_info: None,
+                reverse_proxy: None,
                 ipv6_available: Settings::default_ipv6_available(),
                 tls_handshake_timeout: Settings::default_tls_handshake_timeout(),
                 client_listener_timeout: Settings::default_client_listener_timeout(),
@@ -564,10 +589,10 @@ impl SettingsBuilder {
             if x.hostname == self.settings.tunnel_tls_host_info.hostname {
                 return Err(BuilderError::PingTlsHostInfo("Host name equals to tunneling one".into()));
             }
-            if self.settings.service_messenger_tls_host_info.as_ref()
-                .map_or(false, |i| x.hostname == i.hostname)
+            if self.settings.reverse_proxy.as_ref()
+                .map_or(false, |s| x.hostname == s.tls_info.hostname)
             {
-                return Err(BuilderError::PingTlsHostInfo("Host name equals to service messenger one".into()));
+                return Err(BuilderError::PingTlsHostInfo("Host name equals to reverse proxy one".into()));
             }
             validate_file_path(&x.cert_chain_path)
                 .map_err(|e| BuilderError::PingTlsHostInfo(format!("Invalid cert chain path: {}", e)))?;
@@ -575,19 +600,22 @@ impl SettingsBuilder {
                 .map_err(|e| BuilderError::PingTlsHostInfo(format!("Invalid key path: {}", e)))?;
         }
 
-        if let Some(x) = &self.settings.service_messenger_tls_host_info {
-            if x.hostname == self.settings.tunnel_tls_host_info.hostname {
-                return Err(BuilderError::ServiceMessengerTlsHostInfo("Host name equals to tunneling one".into()));
+        if let Some(x) = &self.settings.reverse_proxy {
+            if x.server_address.ip().is_unspecified() && x.server_address.port() == 0 {
+                return Err(BuilderError::ReverseProxy("Invalid origin server address".into()));
+            }
+            if x.tls_info.hostname == self.settings.tunnel_tls_host_info.hostname {
+                return Err(BuilderError::ReverseProxy("Host name equals to tunneling one".into()));
             }
             if self.settings.ping_tls_host_info.as_ref()
-                .map_or(false, |i| x.hostname == i.hostname)
+                .map_or(false, |i| x.tls_info.hostname == i.hostname)
             {
-                return Err(BuilderError::ServiceMessengerTlsHostInfo("Host name equals to HTTPS pinging one".into()));
+                return Err(BuilderError::ReverseProxy("Host name equals to HTTPS pinging one".into()));
             }
-            validate_file_path(&x.cert_chain_path)
-                .map_err(|e| BuilderError::ServiceMessengerTlsHostInfo(format!("Invalid cert chain path: {}", e)))?;
-            validate_file_path(&x.private_key_path)
-                .map_err(|e| BuilderError::ServiceMessengerTlsHostInfo(format!("Invalid key path: {}", e)))?;
+            validate_file_path(&x.tls_info.cert_chain_path)
+                .map_err(|e| BuilderError::ReverseProxy(format!("Invalid cert chain path: {}", e)))?;
+            validate_file_path(&x.tls_info.private_key_path)
+                .map_err(|e| BuilderError::ReverseProxy(format!("Invalid key path: {}", e)))?;
         }
 
         if self.settings.listen_protocols.is_empty() {
@@ -625,18 +653,20 @@ impl SettingsBuilder {
     /// Set the TLS host info for HTTPS pinging.
     /// With this one set up the endpoint will respond with `200 OK` to HTTPS `GET` requests
     /// to the specified domain.
-    /// The host name MUST differ from the tunneling host and service messanger ones.
+    /// The host name MUST differ from the tunneling host and reverse proxy ones.
     pub fn ping_tls_host_info(mut self, info: TlsHostInfo) -> Self {
         self.settings.ping_tls_host_info = Some(info);
         self
     }
 
-    /// Set the TLS host info of service messenger.
-    /// With this one set up the endpoint will accept TLS connections to the specified host name
-    /// and todo...
-    /// The host name MUST differ from the tunneling host and HTTPS pinging ones.
-    pub fn service_messenger_tls_host_info(mut self, info: TlsHostInfo) -> Self {
-        self.settings.service_messenger_tls_host_info = Some(info);
+    /// Set the reverse proxy settings.
+    /// With this one set up the endpoint will do TLS termination on such connections,
+    /// translate all HTTP requests to HTTP1 protocol and send them to the origin server,
+    /// and, conversely,
+    /// and forward all the data received from a client to the origin server and
+    /// all the data received from the server back to the client.
+    pub fn reverse_proxy(mut self, settings: ReverseProxySettings) -> Self {
+        self.settings.reverse_proxy = Some(settings);
         self
     }
 

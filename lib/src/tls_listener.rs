@@ -6,7 +6,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::{LazyConfigAcceptor, StartHandshake};
 use tokio_rustls::server::TlsStream;
 use crate::{log_utils, utils};
-use crate::protocol_selector::Protocol;
+use crate::protocol_selector::Channel;
 use crate::settings::Settings;
 
 
@@ -50,22 +50,22 @@ impl TlsAcceptor {
             .map(Vec::from)
     }
 
-    pub async fn accept(self, protocol: Protocol, _log_id: &log_utils::IdChain<u64>) -> io::Result<TlsStream<TcpStream>> {
+    pub async fn accept(self, channel: Channel, _log_id: &log_utils::IdChain<u64>) -> io::Result<TlsStream<TcpStream>> {
         let settings = &self.core_settings;
         let tunnel_tls_info = &settings.tunnel_tls_host_info;
         let ping_tls_info = settings.ping_tls_host_info.as_ref();
-        let sm_tls_info = settings.service_messenger_tls_host_info.as_ref();
+        let sm_tls_info = settings.reverse_proxy.as_ref().map(|x| &x.tls_info);
 
-        let (cert_file, key_file) = match protocol {
-            Protocol::Ping(_) => (
+        let (cert_file, key_file) = match channel {
+            Channel::Ping(_) => (
                 &ping_tls_info.unwrap().cert_chain_path,
                 &ping_tls_info.unwrap().private_key_path,
             ),
-            Protocol::ServiceMessenger(_) => (
+            Channel::ReverseProxy(_) => (
                 &sm_tls_info.unwrap().cert_chain_path,
                 &sm_tls_info.unwrap().private_key_path,
             ),
-            Protocol::Tunnel(_) => match self.inner.client_hello().server_name() {
+            Channel::Tunnel(_) => match self.inner.client_hello().server_name() {
                 None => return Err(io::Error::new(ErrorKind::Other, "Client hello has no SNI")),
                 Some(x) if x == tunnel_tls_info.hostname => (
                     &tunnel_tls_info.cert_chain_path,
@@ -94,7 +94,7 @@ impl TlsAcceptor {
                     ErrorKind::Other, format!("Failed to create TLS configuration: {}", e))
                 )?;
 
-            cfg.alpn_protocols = vec![protocol.as_alpn().as_bytes().to_vec()];
+            cfg.alpn_protocols = vec![channel.as_alpn().as_bytes().to_vec()];
             Arc::new(cfg)
         };
 

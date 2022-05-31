@@ -291,11 +291,11 @@ impl QuicMultiplexer {
                 Ok(ServerNameCheckStatus::RetryAs(
                     settings.ping_tls_host_info.as_ref().unwrap(),
                 )),
-            Some(x) if settings.service_messenger_tls_host_info.as_ref().map_or(
-                false, |info| info.hostname == x
+            Some(x) if settings.reverse_proxy.as_ref().map_or(
+                false, |s| s.tls_info.hostname == x
             ) =>
                 Ok(ServerNameCheckStatus::RetryAs(
-                    settings.service_messenger_tls_host_info.as_ref().unwrap(),
+                    &settings.reverse_proxy.as_ref().unwrap().tls_info,
                 )),
             x => return Err(io::Error::new(
                 ErrorKind::Other, format!("Unexpected server name in TLS handshake: {:?}", x)
@@ -737,31 +737,32 @@ impl QuicSocket {
         let mut request_builder = http::request::Request::builder()
             .version(http::Version::HTTP_3);
 
+        let mut uri_builder = http::uri::Uri::builder();
         for h in headers {
-            request_builder = match h.name() {
-                b":method" => request_builder.method(h.value()),
-                b":authority" => request_builder.uri(
-                    http::uri::Uri::builder()
-                        .scheme("https")
-                        .authority(h.value())
-                        .path_and_query("")
-                        .build()
-                        .map_err(|e| io::Error::new(
-                            ErrorKind::InvalidData,
-                            format!("Unexpected URI: error={}, authority=0x{}", e, utils::hex_dump(h.value()))
-                        ))?
-                ),
-                x => match http::header::HeaderName::from_lowercase(x) {
+            match h.name() {
+                b":method" => request_builder = request_builder.method(h.value()),
+                b":scheme" => uri_builder = uri_builder.scheme(h.value()),
+                b":authority" => uri_builder = uri_builder.authority(h.value()),
+                b":path" => uri_builder = uri_builder.path_and_query(h.value()),
+                x => request_builder = match http::header::HeaderName::from_lowercase(x) {
                     Ok(name) => request_builder.header(name, h.value()),
                     Err(InvalidHeaderName { .. }) => return Err(io::Error::new(
                         ErrorKind::InvalidData,
                         format!("Unexpected header name: 0x{}", utils::hex_dump(h.name()))
                     )),
                 }
-            };
+            }
         }
 
-        request_builder.body(())
+        request_builder
+            .uri(uri_builder
+                .build()
+                .map_err(|e| io::Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Invalid URI: {}", e)
+                ))?
+            )
+            .body(())
             .map(|r| QuicSocketEvent::Request(stream_id, Box::new(r.into_parts().0)))
             .map_err(|e| io::Error::new(ErrorKind::Other, format!("Invalid request: {}", e)))
     }

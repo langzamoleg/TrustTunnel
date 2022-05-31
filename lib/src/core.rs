@@ -2,10 +2,11 @@ use std::io;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, UdpSocket};
 use crate::direct_forwarder::DirectForwarder;
-use crate::{authentication, http_ping_handler, log_id, log_utils, metrics, protocol_selector, utils};
-use crate::protocol_selector::{Protocol, PingProtocol, ServiceMessengerProtocol, TunnelProtocol};
+use crate::{authentication, http_ping_handler, log_id, log_utils, metrics, protocol_selector, reverse_proxy, utils};
+use crate::protocol_selector::{Channel, Protocol};
 use crate::forwarder::Forwarder;
 use crate::http1_codec::Http1Codec;
 use crate::http2_codec::Http2Codec;
@@ -236,11 +237,11 @@ impl Core {
         };
 
         let core_settings = context.settings.clone();
-        let proto =
+        let channel =
             match protocol_selector::select(&core_settings, alpn.as_deref(), &sni) {
-                Ok(Protocol::Tunnel(TunnelProtocol::Http3))
-                | Ok(Protocol::Ping(PingProtocol::Http3))
-                | Ok(Protocol::ServiceMessenger(ServiceMessengerProtocol::Http3))
+                Ok(Channel::Tunnel(Protocol::Http3))
+                | Ok(Channel::Ping(Protocol::Http3))
+                | Ok(Channel::ReverseProxy(Protocol::Http3))
                 => {
                     log_id!(debug, client_id, "Unexpected connection protocol - dropping tunnel");
                     return;
@@ -251,9 +252,9 @@ impl Core {
                     return;
                 }
             };
-        log_id!(trace, client_id, "Selected protocol: {:?}", proto);
+        log_id!(trace, client_id, "Selected protocol: {:?}", channel);
 
-        let stream = match acceptor.accept(proto, &client_id).await {
+        let stream = match acceptor.accept(channel, &client_id).await {
             Ok(s) => {
                 log_id!(debug, client_id, "New TLS client: {:?}", s);
                 s
@@ -264,8 +265,8 @@ impl Core {
             }
         };
 
-        match proto {
-            Protocol::Tunnel(protocol) => {
+        match channel {
+            Channel::Tunnel(protocol) => {
                 let tunnel_id = client_id.extended(log_utils::IdItem::new(
                     log_utils::TUNNEL_ID_FMT, context.next_tunnel_id.fetch_add(1, Ordering::Relaxed)
                 ));
@@ -273,32 +274,20 @@ impl Core {
                 Self::on_tunnel_request(
                     context,
                     protocol,
-                    match protocol {
-                        TunnelProtocol::Http1 => Box::new(Http1Codec::new(
-                            core_settings, stream, tunnel_id.clone(),
-                        )),
-                        TunnelProtocol::Http2 => Box::new(Http2Codec::new(
-                            core_settings, stream, tunnel_id.clone(),
-                        )),
-                        TunnelProtocol::Http3 => unreachable!(),
-                    },
+                    Self::make_tcp_http_codec(protocol, core_settings, stream, tunnel_id.clone()),
                     &sni,
                     tunnel_id,
                 ).await
             }
-            Protocol::Ping(protocol) => http_ping_handler::listen(
-                match protocol {
-                    PingProtocol::Http1 => Box::new(Http1Codec::new(
-                        core_settings, stream, client_id.clone(),
-                    )),
-                    PingProtocol::Http2 => Box::new(Http2Codec::new(
-                        core_settings, stream, client_id.clone(),
-                    )),
-                    PingProtocol::Http3 => unreachable!(),
-                },
+            Channel::Ping(protocol) => http_ping_handler::listen(
+                Self::make_tcp_http_codec(protocol, core_settings, stream, client_id.clone()),
                 client_id,
             ).await,
-            Protocol::ServiceMessenger(_) => { todo!() }
+            Channel::ReverseProxy(protocol) => reverse_proxy::listen(
+                context,
+                Self::make_tcp_http_codec(protocol, core_settings, stream, client_id.clone()),
+                client_id,
+            ).await,
         }
     }
 
@@ -321,9 +310,9 @@ impl Core {
         let sni = socket.server_name().unwrap_or_default();
         let proto =
             match protocol_selector::select(&core_settings, Some(&alpn), &sni) {
-                Ok(x) if x == Protocol::Tunnel(TunnelProtocol::Http3)
-                    || x == Protocol::Ping(PingProtocol::Http3)
-                    || x == Protocol::ServiceMessenger(ServiceMessengerProtocol::Http3)
+                Ok(x) if x == Channel::Tunnel(Protocol::Http3)
+                    || x == Channel::Ping(Protocol::Http3)
+                    || x == Channel::ReverseProxy(Protocol::Http3)
                 => x,
                 Ok(x) => {
                     log_id!(debug, client_id, "Unexpected connection protocol ({:?}) - dropping tunnel", x);
@@ -337,7 +326,7 @@ impl Core {
         log_id!(trace, client_id, "Selected protocol: {:?}", proto);
 
         match proto {
-            Protocol::Tunnel(protocol) => {
+            Channel::Tunnel(protocol) => {
                 let tunnel_id = client_id.extended(log_utils::IdItem::new(
                     log_utils::TUNNEL_ID_FMT, context.next_tunnel_id.fetch_add(1, Ordering::Relaxed)
                 ));
@@ -350,17 +339,21 @@ impl Core {
                     tunnel_id,
                 ).await
             }
-            Protocol::Ping(_) => http_ping_handler::listen(
+            Channel::Ping(_) => http_ping_handler::listen(
                 Box::new(Http3Codec::new(socket, client_id.clone())),
                 client_id,
             ).await,
-            Protocol::ServiceMessenger(_) => { todo!() }
+            Channel::ReverseProxy(_) => reverse_proxy::listen(
+                context,
+                Box::new(Http3Codec::new(socket, client_id.clone())),
+                client_id,
+            ).await,
         }
     }
 
     async fn on_tunnel_request(
         context: Arc<Context>,
-        protocol: TunnelProtocol,
+        protocol: Protocol,
         codec: Box<dyn HttpCodec>,
         server_name: &str,
         tunnel_id: log_utils::IdChain<u64>,
@@ -392,6 +385,23 @@ impl Core {
         match tunnel.listen().await {
             Ok(_) => log_id!(debug, tunnel_id, "Tunnel stopped gracefully"),
             Err(e) => log_id!(debug, tunnel_id, "Tunnel stopped with error: {}", e),
+        }
+    }
+
+    fn make_tcp_http_codec<IO: 'static + AsyncRead + AsyncWrite + Unpin + Send>(
+        protocol: Protocol,
+        core_settings: Arc<Settings>,
+        io: IO,
+        log_id: log_utils::IdChain<u64>,
+    ) -> Box<dyn HttpCodec> {
+        match protocol {
+            Protocol::Http1 => Box::new(Http1Codec::new(
+                core_settings, io, log_id.clone(),
+            )),
+            Protocol::Http2 => Box::new(Http2Codec::new(
+                core_settings, io, log_id.clone(),
+            )),
+            Protocol::Http3 => unreachable!(),
         }
     }
 

@@ -7,13 +7,13 @@ use bytes::{BufMut, Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use crate::{datagram_pipe, http_codec, log_id, log_utils, pipe, utils};
-use crate::protocol_selector::TunnelProtocol;
+use crate::protocol_selector::Protocol;
 use crate::http_codec::{RequestHeaders, ResponseHeaders};
 use crate::settings::Settings;
 
 
-const MAX_RAW_HEADERS_SIZE: usize = 1024;
-const MAX_HEADERS_NUM: usize = 32;
+pub(crate) const MAX_RAW_HEADERS_SIZE: usize = 1024;
+pub(crate) const MAX_HEADERS_NUM: usize = 32;
 const TRAFFIC_READ_CHUNK_SIZE: usize = 16 * 1024;
 
 
@@ -30,6 +30,11 @@ pub(crate) struct Http1Codec<IO> {
     upload_tx: mpsc::Sender<Option<Bytes>>,
     parent_id_chain: log_utils::IdChain<u64>,
     next_request_id: std::ops::RangeFrom<u64>,
+}
+
+pub(crate) enum DecodeStatus<Headers> {
+    Partial(BytesMut),
+    Complete(Headers, BytesMut),
 }
 
 enum State {
@@ -60,6 +65,7 @@ struct StreamSource {
 struct StreamSink {
     /// Sends messages to [`Http1Codec.download_rx`]
     download_tx: mpsc::Sender<Option<Bytes>>,
+    insert_connection_close: bool,
     id: log_utils::IdChain<u64>,
 }
 
@@ -94,89 +100,50 @@ impl<IO> Http1Codec<IO> {
     }
 
     fn on_request_headers_chunk(&mut self, buffer: BytesMut) -> io::Result<RequestStatus> {
-        let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS_NUM];
-        let mut request = httparse::Request::new(&mut headers);
-        match request.parse(&buffer) {
-            Ok(httparse::Status::Complete(_)) => {
-                let mut request_builder = http::request::Request::builder()
-                    .version(httparse_to_http_version(request.version.unwrap()))
-                    .method(request.method.unwrap());
-
-                let mut uri = match request.path {
-                    None => return Err(io::Error::new(
-                        ErrorKind::Other, format!("Invalid path: {:?}", request.path)
-                    )),
-                    Some(p) => match http::uri::Uri::from_str(p) {
-                        Ok(uri) => uri,
-                        Err(e) => return Err(io::Error::new(
+        match decode_request(buffer, MAX_HEADERS_NUM, MAX_RAW_HEADERS_SIZE)? {
+            DecodeStatus::Partial(bytes) => {
+                match &mut self.state {
+                    State::WaitingRequest(x) => x.buffer = bytes,
+                    _ => unreachable!(),
+                }
+                Ok(RequestStatus::Partial)
+            }
+            DecodeStatus::Complete(request, tail) => {
+                if request.headers.contains_key("expect") {
+                    return Ok(RequestStatus::NeedRespond(http::response::Builder::new()
+                        .version(request.version)
+                        .status(http::StatusCode::EXPECTATION_FAILED)
+                        .header("Connection", "close")
+                        .body(())
+                        .map_err(|e| io::Error::new(
                             ErrorKind::Other,
-                            format!("Invalid path: path={:?}, error={}", request.path, e)
-                        )),
-                    }
-                };
-
-                for h in request.headers {
-                     match h.name.to_ascii_lowercase().as_str() {
-                        "host" if uri.authority().is_none() =>
-                            uri = http::uri::Uri::builder()
-                                .scheme("https")
-                                .authority(h.value)
-                                .path_and_query(request.path.unwrap())
-                                .build()
-                                .map_err(|e| io::Error::new(
-                                    ErrorKind::Other,
-                                    format!("Unexpected URI: error={}, authority=0x{}", e, utils::hex_dump(h.value))
-                                ))?,
-                        "expect" => {
-                            return Ok(RequestStatus::NeedRespond(http::response::Builder::new()
-                                .version(httparse_to_http_version(request.version.unwrap()))
-                                .status(http::StatusCode::EXPECTATION_FAILED)
-                                .body(())
-                                .map_err(|e| io::Error::new(
-                                    ErrorKind::Other,
-                                    format!("Failed to build \"Expectation Failed\" response: {}", e)
-                                ))?
-                                .into_parts().0
-                            ));
-                        }
-                        _ => request_builder = request_builder.header(h.name, h.value),
-                    }
+                            format!("Failed to build \"Expectation Failed\" response: {}", e)
+                        ))?
+                        .into_parts().0
+                    ));
                 }
 
-                request_builder = request_builder.uri(uri);
-
                 let _ = std::mem::replace(&mut self.state, State::RequestInProgress(RequestInProgress {
-                    buffer: BytesMut::with_capacity(TRAFFIC_READ_CHUNK_SIZE),
+                    buffer: tail,
                 }));
 
                 let id = self.parent_id_chain.extended(log_utils::IdItem::new(
                     log_utils::CONNECTION_ID_FMT, self.next_request_id.next().unwrap()
                 ));
-                let request = request_builder.body(())
-                    .map_err(|e| io::Error::new(ErrorKind::Other, format!("Invalid request: {}", e)))?;
+                let insert_connection_close = request.method == http::Method::CONNECT;
                 Ok(RequestStatus::Complete(Box::new(Stream {
                     source: StreamSource {
-                        request: request.into_parts().0,
+                        request,
                         upload_rx: self.upload_rx.take().unwrap(),
                         id: id.clone(),
                     },
                     sink: StreamSink {
                         download_tx: self.download_tx.take().unwrap(),
+                        insert_connection_close,
                         id,
                     }
                 })))
             }
-            Ok(httparse::Status::Partial) if buffer.len() < MAX_RAW_HEADERS_SIZE => {
-                match &mut self.state {
-                    State::WaitingRequest(x) => x.buffer = buffer,
-                    _ => unreachable!(),
-                }
-                Ok(RequestStatus::Partial)
-            },
-            Ok(httparse::Status::Partial) => Err(io::Error::new(
-                ErrorKind::Other, "Too long HTTP request headers"
-            )),
-            Err(e) => Err(io::Error::new(ErrorKind::Other, e.to_string())),
         }
     }
 }
@@ -187,10 +154,12 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> http_codec::HttpCodec for Http1C
         loop {
             let wait_read = async {
                 let mut buffer = self.state.take_buffer();
-                if matches!(self.state, State::RequestInProgress(_)) {
-                    let _ = self.upload_tx.reserve().await;
+                if buffer.is_empty() {
+                    if matches!(self.state, State::RequestInProgress(_)) {
+                        let _ = self.upload_tx.reserve().await;
+                    }
+                    self.transport_stream.read_buf(&mut buffer).await?;
                 }
-                self.transport_stream.read_buf(&mut buffer).await?;
                 Ok(buffer)
             };
 
@@ -205,7 +174,7 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> http_codec::HttpCodec for Http1C
                                 RequestStatus::Complete(stream) => return Ok(Some(stream)),
                                 RequestStatus::NeedRespond(response) => {
                                     log_id!(debug, self.parent_id_chain, "Tunnel rejected, responding with: {:?}", response);
-                                    let mut response = serialize_response(response);
+                                    let mut response = encode_response(response);
                                     self.transport_stream.write_all_buf(&mut response).await?;
                                     return Ok(None);
                                 }
@@ -240,8 +209,8 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> http_codec::HttpCodec for Http1C
         self.transport_stream.shutdown().await
     }
 
-    fn protocol(&self) -> TunnelProtocol {
-        TunnelProtocol::Http1
+    fn protocol(&self) -> Protocol {
+        Protocol::Http1
     }
 }
 
@@ -278,12 +247,15 @@ impl http_codec::PendingRespond for StreamSink {
         self.id.clone()
     }
 
-    fn send_response(self: Box<Self>, response: ResponseHeaders, eof: bool)
+    fn send_response(self: Box<Self>, mut response: ResponseHeaders, eof: bool)
         -> io::Result<Box<dyn http_codec::RespondedStreamSink>>
     {
+        if self.insert_connection_close && !response.headers.contains_key("Connection") {
+            response.headers.insert("Connection", http::HeaderValue::from_static("close"));
+        }
         log_id!(debug, self.id, "Sending response: {:?} (eof={})", response, eof);
 
-        if let Err(e) = self.download_tx.try_send(Some(serialize_response(response))) {
+        if let Err(e) = self.download_tx.try_send(Some(encode_response(response))) {
             return Err(io::Error::new(
                 ErrorKind::Other, format!("Failed to put response in queue: {}", e)
             ));
@@ -388,25 +360,160 @@ fn httparse_to_http_version(v: u8) -> http::Version {
     }
 }
 
-fn serialize_response(response: ResponseHeaders) -> Bytes {
-    let mut serialized = BytesMut::new();
-
-    serialized.put(
-        format!(
-            "HTTP/1.{} {} {}\r\n",
-            version_minor_digit(response.version),
-            response.status.as_str(),
-            response.status.canonical_reason().unwrap(),
-        ).as_bytes()
-    );
-
-    for (name, value) in &response.headers {
-        serialized.put(format!("{}: ", name).as_bytes());
-        serialized.put(value.as_bytes());
-        serialized.put("\r\n".as_bytes());
+fn encode_headers(mut buffer: BytesMut, headers: &http::HeaderMap<http::HeaderValue>) -> BytesMut {
+    for (name, value) in headers {
+        buffer.put(name.as_ref());
+        buffer.put(": ".as_bytes());
+        buffer.put(value.as_bytes());
+        buffer.put("\r\n".as_bytes());
     }
-    serialized.put("Connection: close\r\n".as_bytes());
-    serialized.put("\r\n".as_bytes());
+    buffer.put("\r\n".as_bytes());
 
-    serialized.freeze()
+    buffer
+}
+
+pub(crate) fn encode_request(request: &RequestHeaders) -> Bytes {
+    let mut encoded = BytesMut::new();
+
+    encoded.put(request.method.as_str().as_bytes());
+    encoded.put([b' '].as_slice());
+    encoded.put(request.uri.path().as_bytes());
+    encoded.put(" HTTP/1.".as_bytes());
+    encoded.put([('0' as u32 + version_minor_digit(request.version)) as u8].as_slice());
+    encoded.put("\r\n".as_bytes());
+
+    if let Some(host) = request.uri.authority() {
+        encoded.put("Host: ".as_bytes());
+        encoded.put(host.as_str().as_bytes());
+        encoded.put("\r\n".as_bytes());
+    }
+
+    encoded = encode_headers(encoded, &request.headers);
+
+    encoded.freeze()
+}
+
+pub(crate) fn encode_response(response: ResponseHeaders) -> Bytes {
+    let mut encoded = BytesMut::new();
+
+    encoded.put("HTTP/1.".as_bytes());
+    encoded.put([('0' as u32 + version_minor_digit(response.version)) as u8].as_slice());
+    encoded.put([b' '].as_slice());
+    encoded.put(response.status.as_str().as_bytes());
+    encoded.put([b' '].as_slice());
+    encoded.put(response.status.canonical_reason().unwrap_or_default().as_bytes());
+    encoded.put("\r\n".as_bytes());
+
+    encoded = encode_headers(encoded, &response.headers);
+
+    encoded.freeze()
+}
+
+pub(crate) fn decode_request(
+    mut buffer: BytesMut,
+    headers_num_cap: usize,
+    raw_buffer_cap: usize,
+) -> io::Result<DecodeStatus<RequestHeaders>> {
+    let mut headers = vec![httparse::EMPTY_HEADER; headers_num_cap];
+    let mut request = httparse::Request::new(&mut headers);
+    match request.parse(&buffer) {
+        Ok(httparse::Status::Complete(idx)) => {
+            let mut request_builder = http::request::Request::builder()
+                .version(httparse_to_http_version(
+                    request.version
+                        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Version not found"))?
+                ))
+                .method(
+                    request.method
+                        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Method not found"))?
+                );
+
+            let mut uri = match request.path {
+                None => return Err(io::Error::new(
+                    ErrorKind::Other, format!("Invalid path: {:?}", request.path)
+                )),
+                Some(p) => match http::uri::Uri::from_str(p) {
+                    Ok(uri) => uri,
+                    Err(e) => return Err(io::Error::new(
+                        ErrorKind::Other,
+                        format!("Invalid path: path={:?}, error={}", request.path, e)
+                    )),
+                }
+            };
+
+            for h in request.headers {
+                match h.name.to_lowercase().as_str() {
+                    "host" if uri.authority().is_none() =>
+                        uri = http::uri::Uri::builder()
+                            .scheme("https")
+                            .authority(h.value)
+                            .path_and_query(request.path.unwrap())
+                            .build()
+                            .map_err(|e| io::Error::new(
+                                ErrorKind::Other,
+                                format!("Unexpected URI: error={}, authority={}, path={:?}",
+                                        e, utils::hex_dump(h.value), request.path,
+                                )
+                            ))?,
+                    _ => request_builder = request_builder.header(h.name, h.value),
+                }
+            }
+
+            request_builder = request_builder.uri(uri);
+
+            Ok(DecodeStatus::Complete(
+                request_builder.body(())
+                    .map_err(|e| io::Error::new(ErrorKind::Other, format!("Invalid request: {}", e)))?
+                    .into_parts().0,
+                buffer.split_off(idx),
+            ))
+        }
+        Ok(httparse::Status::Partial) if buffer.len() < raw_buffer_cap => {
+            Ok(DecodeStatus::Partial(buffer))
+        },
+        Ok(httparse::Status::Partial) => Err(io::Error::new(
+            ErrorKind::Other, "Too long HTTP request headers"
+        )),
+        Err(e) => Err(io::Error::new(ErrorKind::Other, e.to_string())),
+    }
+}
+
+pub(crate) fn decode_response(
+    mut buffer: BytesMut,
+    headers_num_cap: usize,
+    raw_buffer_cap: usize,
+) -> io::Result<DecodeStatus<ResponseHeaders>> {
+    let mut headers = vec![httparse::EMPTY_HEADER; headers_num_cap];
+    let mut response = httparse::Response::new(&mut headers);
+    match response.parse(&buffer) {
+        Ok(httparse::Status::Complete(idx)) => {
+            let mut response_builder = http::response::Response::builder()
+                .version(httparse_to_http_version(
+                    response.version
+                        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Version not found"))?
+                ))
+                .status(
+                    response.code
+                        .ok_or_else(|| io::Error::new(ErrorKind::Other, "Status not found"))?
+                );
+
+            for h in response.headers {
+                response_builder = response_builder.header(h.name, h.value)
+            }
+
+            Ok(DecodeStatus::Complete(
+                response_builder.body(())
+                    .map_err(|e| io::Error::new(ErrorKind::Other, format!("Invalid response: {}", e)))?
+                    .into_parts().0,
+                buffer.split_off(idx),
+            ))
+        }
+        Ok(httparse::Status::Partial) if buffer.len() < raw_buffer_cap => {
+            Ok(DecodeStatus::Partial(buffer))
+        },
+        Ok(httparse::Status::Partial) => Err(io::Error::new(
+            ErrorKind::Other, "Too long HTTP response headers"
+        )),
+        Err(e) => Err(io::Error::new(ErrorKind::Other, e.to_string())),
+    }
 }

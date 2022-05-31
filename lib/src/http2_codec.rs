@@ -10,7 +10,7 @@ use h2::server::{Connection, Handshake, SendResponse};
 use tokio::io::{AsyncRead, AsyncWrite};
 use crate::http_codec::{HttpCodec, RequestHeaders, ResponseHeaders};
 use crate::{datagram_pipe, http_codec, log_id, log_utils, pipe};
-use crate::protocol_selector::TunnelProtocol;
+use crate::protocol_selector::Protocol;
 use crate::settings::{ListenProtocolSettings, Settings};
 
 
@@ -144,8 +144,8 @@ impl<IO: AsyncRead + AsyncWrite + Send + Unpin> HttpCodec for Http2Codec<IO> {
         }
     }
 
-    fn protocol(&self) -> TunnelProtocol {
-        TunnelProtocol::Http2
+    fn protocol(&self) -> Protocol {
+        Protocol::Http2
     }
 }
 

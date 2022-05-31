@@ -5,7 +5,7 @@ use bytes::Bytes;
 use http::{Response, StatusCode};
 use http::uri::Authority;
 use crate::{authentication, datagram_pipe, log_utils, pipe};
-use crate::protocol_selector::TunnelProtocol;
+use crate::protocol_selector::Protocol;
 
 
 pub(crate) type RequestHeaders = http::request::Parts;
@@ -130,5 +130,5 @@ pub(crate) trait HttpCodec: Send {
     async fn graceful_shutdown(&mut self) -> io::Result<()>;
 
     /// Get the codec protocol
-    fn protocol(&self) -> TunnelProtocol;
+    fn protocol(&self) -> Protocol;
 }
