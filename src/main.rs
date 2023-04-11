@@ -148,8 +148,6 @@ fn main() {
                 core.reload_tls_hosts_settings(tls_hosts_settings).expect("Couldn't apply new settings");
                 info!("TLS hosts settings are successfully reloaded");
             }
-
-            () // Needed for type deduction
         }
     };
 

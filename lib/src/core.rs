@@ -198,7 +198,7 @@ impl Core {
                             ).await {
                                 log_id!(debug, client_id, "{}", message);
                             },
-                        Err(e) => log_id!(debug, client_id, "TLS handshake failed: {}", e),
+                        Err(e) => log_id!(trace, client_id, "TLS handshake failed: {}", e),
                     }
                 }
             });

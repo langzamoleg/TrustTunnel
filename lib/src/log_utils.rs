@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
+use std::ops::DerefMut;
 use std::sync::Mutex;
 use dynfmt::Format;
 use log::{Log, Metadata, Record};
@@ -34,6 +35,16 @@ pub fn make_file_logger(path: &str) -> std::io::Result<&'static impl Log> {
 }
 
 
+fn write_record(mut w: impl Write, record: &Record) -> std::io::Result<()> {
+    writeln!(w, "{} [{:?}] [{}] [{}] {}",
+             chrono::Local::now().format("%T.%6f"),
+             std::thread::current().id(),
+             record.level(),
+             record.target(),
+             record.args(),
+    )
+}
+
 impl Log for StdoutLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
         metadata.level() <= log::max_level()
@@ -41,13 +52,7 @@ impl Log for StdoutLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            println!("{} [{:?}] [{}] [{}] {}",
-                     chrono::Local::now().format("%T.%6f"),
-                     std::thread::current().id(),
-                     record.level(),
-                     record.target(),
-                     record.args(),
-            );
+            write_record(std::io::stdout(), record).unwrap();
         }
     }
 
@@ -76,14 +81,7 @@ impl Log for FileLogger {
 
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
-            if let Err(e) = self.file.lock().unwrap().write_fmt(format_args!(
-                "{} [{:?}] [{}] [{}] {}\n",
-                chrono::Local::now().format("%T.%6f"),
-                std::thread::current().id(),
-                record.level(),
-                record.target(),
-                record.args(),
-            )) {
+            if let Err(e) = write_record(self.file.lock().unwrap().deref_mut(), record) {
                 eprintln!("Log write failure: {}", e);
             }
         }
@@ -123,7 +121,6 @@ macro_rules! log_id {
 pub(crate) const CLIENT_ID_FMT: &str = "CLIENT={}";
 pub(crate) const TUNNEL_ID_FMT: &str = "TUN={}";
 pub(crate) const CONNECTION_ID_FMT: &str = "CONN={}";
-
 
 
 #[derive(Copy, Clone)]
