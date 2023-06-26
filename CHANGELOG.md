@@ -1,5 +1,7 @@
 # CHANGELOG
 
+* Removed RADIUS-based authenticator
+
 ## 0.9.45
 
 * The executable now expects that the configuration files are TOML-formatted

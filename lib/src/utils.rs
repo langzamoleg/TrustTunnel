@@ -5,9 +5,6 @@ use rustls::{Certificate, PrivateKey};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 
 
-pub(crate) const SHA1_DIGEST_SIZE: usize = 20;
-
-
 pub fn hex_dump(buf: &[u8]) -> String {
     buf.iter()
         .fold(

@@ -11,7 +11,6 @@ use serde::Deserialize;
 
 use crate::authentication::Authenticator;
 use crate::authentication::file_based::FileBasedAuthenticator;
-use crate::authentication::radius::RadiusAuthenticator;
 use crate::utils;
 
 pub type Socks5BuilderResult<T> = Result<T, Socks5Error>;
@@ -220,8 +219,6 @@ pub struct ListenProtocolSettings {
 pub enum AuthenticatorSettings {
     /// Authenticate using [`FileBasedAuthenticator`]
     File(FileBasedAuthenticatorSettings),
-    /// Authenticate using [`RadiusAuthenticator`]
-    Radius(RadiusAuthenticatorSettings),
 }
 
 #[derive(Deserialize)]
@@ -229,27 +226,6 @@ pub struct FileBasedAuthenticatorSettings {
     /// A path to the file containing the authentication info
     #[serde(deserialize_with = "deserialize_file_path")]
     pub(crate) path: String,
-}
-
-#[derive(Deserialize)]
-pub struct RadiusAuthenticatorSettings {
-    /// The RADIUS server address
-    pub(crate) server_address: SocketAddr,
-    /// Timeout of the authentication procedure
-    #[serde(default = "RadiusAuthenticatorSettings::default_timeout")]
-    #[serde(rename(deserialize = "timeout_secs"))]
-    #[serde(deserialize_with = "deserialize_duration_secs")]
-    pub(crate) timeout: Duration,
-    /// The password shared between the client and the RADIUS server
-    pub(crate) secret: String,
-    /// The authentication cache capacity
-    #[serde(default = "RadiusAuthenticatorSettings::default_cache_size")]
-    pub(crate) cache_size: usize,
-    /// The authentication cache entry TTL
-    #[serde(default = "RadiusAuthenticatorSettings::default_cache_ttl")]
-    #[serde(rename(deserialize = "cache_ttl_secs"))]
-    #[serde(deserialize_with = "deserialize_duration_secs")]
-    pub(crate) cache_ttl: Duration,
 }
 
 #[derive(Deserialize)]
@@ -379,10 +355,6 @@ pub struct QuicSettingsBuilder {
 
 pub struct ReverseProxySettingsBuilder {
     settings: ReverseProxySettings,
-}
-
-pub struct RadiusAuthenticatorSettingsBuilder {
-    settings: RadiusAuthenticatorSettings,
 }
 
 pub struct IcmpSettingsBuilder {
@@ -644,24 +616,6 @@ impl ReverseProxySettings {
         }
 
         Ok(())
-    }
-}
-
-impl RadiusAuthenticatorSettings {
-    pub fn builder() -> RadiusAuthenticatorSettingsBuilder {
-        RadiusAuthenticatorSettingsBuilder::new()
-    }
-
-    fn default_timeout() -> Duration {
-        Duration::from_secs(3)
-    }
-
-    fn default_cache_size() -> usize {
-        1024
-    }
-
-    fn default_cache_ttl() -> Duration {
-        Duration::from_secs(10)
     }
 }
 
@@ -1118,57 +1072,6 @@ impl ReverseProxySettingsBuilder {
     }
 }
 
-impl RadiusAuthenticatorSettingsBuilder {
-    fn new() -> Self {
-        Self {
-            settings: RadiusAuthenticatorSettings {
-                server_address: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
-                timeout: RadiusAuthenticatorSettings::default_timeout(),
-                secret: Default::default(),
-                cache_size: RadiusAuthenticatorSettings::default_cache_size(),
-                cache_ttl: RadiusAuthenticatorSettings::default_cache_ttl(),
-            },
-        }
-    }
-
-    /// Finalize [`RadiusAuthenticatorSettings`]
-    pub fn build(self) -> RadiusAuthenticatorSettings {
-        self.settings
-    }
-
-    /// Set the RADIUS server address
-    pub fn server_address<A: ToSocketAddrs>(mut self, v: A) -> io::Result<Self> {
-        self.settings.server_address = v.to_socket_addrs()?
-            .next()
-            .ok_or_else(|| io::Error::new(ErrorKind::Other, "Parsed address to empty list"))?;
-        Ok(self)
-    }
-
-    /// Set timeout of the authentication procedure
-    pub fn timeout(mut self, v: Duration) -> Self {
-        self.settings.timeout = v;
-        self
-    }
-
-    /// Set the password shared between the client and the RADIUS server
-    pub fn secret(mut self, v: String) -> Self {
-        self.settings.secret = v;
-        self
-    }
-
-    /// Set the authentication cache capacity
-    pub fn cache_size(mut self, v: usize) -> Self {
-        self.settings.cache_size = v;
-        self
-    }
-
-    /// Set the authentication cache entry TTL
-    pub fn cache_ttl(mut self, v: Duration) -> Self {
-        self.settings.cache_ttl = v;
-        self
-    }
-}
-
 impl IcmpSettingsBuilder {
     fn new() -> Self {
         Self {
@@ -1308,9 +1211,6 @@ fn deserialize_authenticator<'de, D>(deserializer: D) -> Result<Option<Arc<dyn A
                     serde::de::Unexpected::Other(&format!("authenticator initialization error: {}", e)),
                     &"a file with valid authentication info",
                 ))?
-        ))),
-        AuthenticatorSettings::Radius(x) => Ok(Some(Arc::new(
-            RadiusAuthenticator::new(x)
         ))),
     }
 }
