@@ -42,6 +42,8 @@ Build on Linux:
             #!/bin/bash
             set -x -e
 
+            ENDPOINT_ROOT=${PWD}
+
             # Build for x86_64 (use musl for static binaries)
             CC=x86_64-linux-musl-gcc \
             CXX=x86_64-linux-musl-g++ \
@@ -49,34 +51,40 @@ Build on Linux:
             BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/opt/cross/x86_64-linux-musl" \
             cargo build --release --target x86_64-unknown-linux-musl
 
-            cp target/x86_64-unknown-linux-musl/release/vpn_endpoint target/vpn_endpoint.linux-x86_64
-            cp target/x86_64-unknown-linux-musl/release/setup_wizard target/setup_wizard.linux-x86_64
-
             # Build for aarch64 (use musl for static binaries)
             CC=aarch64-linux-musl-gcc \
             CXX=aarch64-linux-musl-g++ \
             CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
             BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/opt/cross/aarch64-linux-musl" \
             cargo build --release --target aarch64-unknown-linux-musl
+
             mkdir -p build_linux
             VERSION=$(cat endpoint/Cargo.toml | grep "version = " | head -n 1 | sed -e 's/version = "\(.*\)"/\1/')
-            NAME=trusttunnel-v${VERSION}-linux-aarch64
-            tar zcf build_linux/${NAME}.tar.gz --transform "s,^,${NAME}/," \
-                target/aarch64-unknown-linux-musl/release/vpn_endpoint \
-                target/aarch64-unknown-linux-musl/release/setup_wizard \
-                LICENSE
-            NAME=trusttunnel-v${VERSION}-linux-x86_64
-            tar zcf build_linux/${NAME}.tar.gz --transform "s,^,${NAME}/," \
-                target/x86_64-unknown-linux-musl/release/vpn_endpoint \
-                target/x86_64-unknown-linux-musl/release/setup_wizard \
-                LICENSE
+
+            pushd target/aarch64-unknown-linux-musl/release/
+              llvm-strip vpn_endpoint
+              llvm-strip setup_wizard
+              cp ${ENDPOINT_ROOT}/LICENSE .
+              NAME=trusttunnel-v${VERSION}-linux-aarch64
+              tar zcf ${NAME}.tar.gz --transform "s,^,${NAME}/," vpn_endpoint setup_wizard LICENSE
+              mv ${NAME}.tar.gz ${ENDPOINT_ROOT}/build_linux
+            popd
+
+            pushd target/x86_64-unknown-linux-musl/release/
+              llvm-strip vpn_endpoint
+              llvm-strip setup_wizard
+              cp ${ENDPOINT_ROOT}/LICENSE .
+              NAME=trusttunnel-v${VERSION}-linux-x86_64
+              tar zcf ${NAME}.tar.gz --transform "s,^,${NAME}/," vpn_endpoint setup_wizard LICENSE
+              mv ${NAME}.tar.gz ${ENDPOINT_ROOT}/build_linux
+            popd
   requirements:
     - adg-privileged-docker
   artifact-subscriptions: [ ]
   artifacts:
     - name: Build for Linux
       location: build_linux
-      pattern: 'trusttunnel_client-.*.tar.gz'
+      pattern: 'trusttunnel-.*.tar.gz'
       required: true
       shared: true
 
