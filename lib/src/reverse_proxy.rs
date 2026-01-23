@@ -196,5 +196,6 @@ async fn handle_stream(
         |_, _| (),
     );
 
-    pipe.exchange(context.settings.tcp_connections_timeout).await
+    pipe.exchange(context.settings.tcp_connections_timeout)
+        .await
 }

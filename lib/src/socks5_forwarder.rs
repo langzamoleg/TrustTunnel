@@ -226,7 +226,8 @@ impl forwarder::TcpConnector for TcpConnector {
             }
         };
 
-        let stream = match TcpStream::connect(socks_settings(&self.context.settings).address).await {
+        let stream = match TcpStream::connect(socks_settings(&self.context.settings).address).await
+        {
             Ok(s) => s,
             Err(e) => return Err(tunnel::ConnectionError::Io(e)),
         };

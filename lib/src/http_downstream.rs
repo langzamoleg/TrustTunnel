@@ -64,11 +64,7 @@ struct PendingRequest {
 }
 
 impl HttpDownstream {
-    pub fn new(
-        context: Arc<core::Context>,
-        codec: Box<dyn HttpCodec>,
-        tls_domain: String,
-    ) -> Self {
+    pub fn new(context: Arc<core::Context>, codec: Box<dyn HttpCodec>, tls_domain: String) -> Self {
         Self {
             request_demux: HttpDemux::new(context.settings.clone()),
             context,

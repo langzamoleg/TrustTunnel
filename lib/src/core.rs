@@ -661,11 +661,7 @@ impl Core {
         log_id!(debug, tunnel_id, "New tunnel for client");
         let mut tunnel = Tunnel::new(
             context.clone(),
-            Box::new(HttpDownstream::new(
-                context.clone(),
-                codec,
-                server_name,
-            )),
+            Box::new(HttpDownstream::new(context.clone(), codec, server_name)),
             Self::make_forwarder(context),
             authentication_policy,
             tunnel_id.clone(),

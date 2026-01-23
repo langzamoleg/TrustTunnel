@@ -3,7 +3,7 @@ use crate::settings::Settings;
 use crate::tls_demultiplexer::TlsDemux;
 use crate::utils::Either;
 use crate::{log_id, log_utils, net_utils, tls_demultiplexer, utils};
-use boring::ssl::{SslContextBuilder, SslMethod, SslRef, NameType, SelectCertError};
+use boring::ssl::{NameType, SelectCertError, SslContextBuilder, SslMethod, SslRef};
 use bytes::{Buf, Bytes, BytesMut};
 use http::header::InvalidHeaderName;
 use lazy_static::lazy_static;
@@ -473,7 +473,8 @@ impl QuicMultiplexer {
         packet: &mut [u8],
     ) -> io::Result<QuicConnection> {
         let local_address = self.core_settings.listen_address;
-        let mut quic_config = make_quic_config_with_domain_contexts(&self.core_settings, self.tls_demux.clone())?;
+        let mut quic_config =
+            make_quic_config_with_domain_contexts(&self.core_settings, self.tls_demux.clone())?;
         let mut quic_conn = quiche::accept(scid, odcid, local_address, *peer, &mut quic_config)
             .map_err(|e| {
                 io::Error::new(
@@ -503,7 +504,8 @@ impl QuicMultiplexer {
     ) -> Result<QuicSocket, (io::Error, Arc<std::sync::Mutex<QuicConnection>>)> {
         let quic_conn = conn.quic_conn;
 
-        let sni = quic_conn.lock()
+        let sni = quic_conn
+            .lock()
             .unwrap()
             .server_name()
             .unwrap_or("")
@@ -517,7 +519,11 @@ impl QuicMultiplexer {
                 conn.tls_connection_meta = meta;
             }
         } else {
-            log_id!(debug, self.id, "SNI is empty in finalize_established_connection, using bootstrap meta");
+            log_id!(
+                debug,
+                self.id,
+                "SNI is empty in finalize_established_connection, using bootstrap meta"
+            );
         }
 
         let h3_conn = {
@@ -604,12 +610,7 @@ impl QuicMultiplexer {
 
         // Create QUIC connection - TLS callback will handle certificate selection automatically
         let quic_conn = self
-            .accept_quic_connection(
-                &header.dcid,
-                Some(&odcid),
-                peer,
-                packet,
-            )
+            .accept_quic_connection(&header.dcid, Some(&odcid), peer, packet)
             .map_err(|e| (e, None))?;
 
         // Get connection metadata after handshake (SNI will be available)
@@ -1149,7 +1150,6 @@ fn quic_recv(
     }
 }
 
-
 fn make_quic_config_with_domain_contexts(
     core_settings: &Settings,
     tls_demux: Arc<std::sync::RwLock<TlsDemux>>,
@@ -1158,7 +1158,7 @@ fn make_quic_config_with_domain_contexts(
 
     // Create main SSL context with SNI callback that dynamically creates and switches contexts
     let mut main_ctx = SslContextBuilder::new(SslMethod::tls())?;
-    
+
     // Clone tls_demux for use in callback
     let tls_demux_clone = tls_demux.clone();
     main_ctx.set_select_certificate_callback(move |mut client_hello| {
@@ -1180,24 +1180,35 @@ fn make_quic_config_with_domain_contexts(
 
         let ssl = client_hello.ssl_mut();
 
-        ssl.set_certificate(&meta.boring.chain[0]).map_err(|_| SelectCertError::ERROR)?;
+        ssl.set_certificate(&meta.boring.chain[0])
+            .map_err(|_| SelectCertError::ERROR)?;
 
         for cert in meta.boring.chain.iter().skip(1) {
-            ssl.add_chain_cert(cert).map_err(|_| SelectCertError::ERROR)?;
+            ssl.add_chain_cert(cert)
+                .map_err(|_| SelectCertError::ERROR)?;
         }
 
-        ssl.set_private_key(&meta.boring.key).map_err(|_| SelectCertError::ERROR)?;
+        ssl.set_private_key(&meta.boring.key)
+            .map_err(|_| SelectCertError::ERROR)?;
 
         Ok(())
-});
+    });
 
     // Load bootstrap certificate as default
-    let bootstrap_meta = tls_demux.read().unwrap().get_quic_connection_bootstrap_meta();
+    let bootstrap_meta = tls_demux
+        .read()
+        .unwrap()
+        .get_quic_connection_bootstrap_meta();
     main_ctx.set_certificate_chain_file(&bootstrap_meta.cert_chain_path)?;
     main_ctx.set_private_key_file(&bootstrap_meta.key_path, boring::ssl::SslFiletype::PEM)?;
 
     let mut cfg = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, main_ctx)
-        .map_err(|e| io::Error::new(ErrorKind::Other, format!("Failed to create QUIC config: {}", e)))?;
+        .map_err(|e| {
+        io::Error::new(
+            ErrorKind::Other,
+            format!("Failed to create QUIC config: {}", e),
+        )
+    })?;
     cfg.set_application_protos(h3::APPLICATION_PROTOCOL)
         .unwrap();
     cfg.set_max_idle_timeout(core_settings.client_listener_timeout.as_millis() as u64);
