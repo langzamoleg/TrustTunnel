@@ -34,6 +34,20 @@ pub enum ValidationError {
     NoCredentialsOnPublicAddress,
 }
 
+impl Settings {
+    pub fn clients_list(&self) -> &[Client] {
+        &self.clients.clients
+    }
+
+    pub fn credentials_file_path(&self) -> Option<&str> {
+        if self.clients.path.is_empty() {
+            None
+        } else {
+            Some(&self.clients.path)
+        }
+    }
+}
+
 impl Debug for ValidationError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -150,7 +164,7 @@ pub struct Settings {
     #[serde(skip_serializing)]
     #[serde(rename(deserialize = "credentials_file"))]
     #[serde(deserialize_with = "deserialize_clients")]
-    pub(crate) clients: Vec<Client>,
+    pub(crate) clients: Credentials,
     /// The reverse proxy settings.
     /// With this one set up the endpoint does TLS termination on such connections and
     /// translates HTTP/x traffic into HTTP/1.1 protocol towards the server and back
@@ -185,6 +199,12 @@ pub struct Settings {
     /// https://github.com/serde-rs/serde/issues/642
     #[serde(skip)]
     built: bool,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub(crate) struct Credentials {
+    pub(crate) path: String,
+    pub(crate) clients: Vec<Client>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -493,7 +513,10 @@ impl Settings {
         }
 
         // Do not start the endpoint without credentials on a public address
-        if self.clients.is_empty() && !self.listen_address.ip().is_loopback() {
+        if self.clients.path.is_empty()
+            && self.clients.clients.is_empty()
+            && !self.listen_address.ip().is_loopback()
+        {
             return Err(ValidationError::NoCredentialsOnPublicAddress);
         }
 
@@ -904,7 +927,7 @@ impl SettingsBuilder {
 
     /// Set the client authenticator
     pub fn clients(mut self, x: Vec<Client>) -> Self {
-        self.settings.clients = x;
+        self.settings.clients.clients = x;
         self
     }
 
@@ -1380,7 +1403,7 @@ where
     deserializer.deserialize_str(Visitor)
 }
 
-fn deserialize_clients<'de, D>(deserializer: D) -> Result<Vec<Client>, D::Error>
+fn deserialize_clients<'de, D>(deserializer: D) -> Result<Credentials, D::Error>
 where
     D: serde::de::Deserializer<'de>,
 {
@@ -1433,7 +1456,10 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(res)
+    Ok(Credentials {
+        path,
+        clients: res,
+    })
 }
 
 fn deserialize_rules<'de, D>(deserializer: D) -> Result<Option<rules::RulesEngine>, D::Error>

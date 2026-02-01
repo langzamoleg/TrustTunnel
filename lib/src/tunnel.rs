@@ -12,6 +12,7 @@ use std::fmt::{Display, Formatter};
 use std::io;
 use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 #[derive(Clone)]
 pub(crate) enum AuthenticationPolicy<'this> {
@@ -332,10 +333,24 @@ impl Tunnel {
         );
 
         log_id!(trace, request_id, "TCP connect: pipe exchange started");
-        match pipe
-            .exchange(context.settings.tcp_connections_timeout)
-            .await
-        {
+        let mut revalidate_interval = tokio::time::interval(Duration::from_secs(30));
+        let exchange = pipe.exchange(context.settings.tcp_connections_timeout);
+        tokio::pin!(exchange);
+
+        let exchange_result = loop {
+            tokio::select! {
+                res = &mut exchange => break res,
+                _ = revalidate_interval.tick() => {
+                    if let (Some(auth), Some(authenticator)) = (&meta.auth, context.authenticator.as_ref()) {
+                        if authenticator.authenticate(auth, &request_id) == Status::Reject {
+                            break Err(io::Error::new(ErrorKind::PermissionDenied, "Authentication revoked"));
+                        }
+                    }
+                }
+            }
+        };
+
+        match exchange_result {
             Ok(_) => {
                 log_id!(trace, request_id, "TCP connect: pipe closed gracefully");
                 Ok(())
@@ -394,7 +409,7 @@ impl Tunnel {
             Ok(downstream::DatagramPipeHalves::Udp(dstr_source, dstr_sink)) => {
                 let meta = forwarder::UdpMultiplexerMeta {
                     client_address,
-                    auth: forwarder_auth,
+                    auth: forwarder_auth.clone(),
                     tls_domain,
                     user_agent,
                 };
@@ -458,7 +473,24 @@ impl Tunnel {
             }
         };
 
-        match pipe.exchange().await {
+        let mut revalidate_interval = tokio::time::interval(Duration::from_secs(30));
+        let exchange = pipe.exchange();
+        tokio::pin!(exchange);
+
+        let exchange_result = loop {
+            tokio::select! {
+                res = &mut exchange => break res,
+                _ = revalidate_interval.tick() => {
+                    if let (Some(auth), Some(authenticator)) = (&forwarder_auth, context.authenticator.as_ref()) {
+                        if authenticator.authenticate(auth, &request_id) == Status::Reject {
+                            break Err(io::Error::new(ErrorKind::PermissionDenied, "Authentication revoked"));
+                        }
+                    }
+                }
+            }
+        };
+
+        match exchange_result {
             Ok(_) => {
                 log_id!(trace, request_id, "Datagram multiplexer gracefully closed");
                 Ok(())

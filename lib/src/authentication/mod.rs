@@ -1,3 +1,4 @@
+pub mod file_based;
 pub mod registry_based;
 
 use crate::log_utils;

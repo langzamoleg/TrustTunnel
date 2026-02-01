@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::signal;
-use trusttunnel::authentication::registry_based::RegistryBasedAuthenticator;
+use trusttunnel::authentication::file_based::FileBasedAuthenticator;
 use trusttunnel::authentication::Authenticator;
 use trusttunnel::client_config;
 use trusttunnel::core::Core;
@@ -165,7 +165,7 @@ fn main() {
     )
     .expect("Couldn't parse the settings file");
 
-    if settings.get_clients().is_empty() && settings.get_listen_address().ip().is_loopback() {
+    if settings.credentials_file_path().is_none() && settings.get_listen_address().ip().is_loopback() {
         warn!(
             "No credentials configured (credentials_file is missing). \
             Anyone can connect to this endpoint. This is acceptable for local development \
@@ -201,7 +201,7 @@ fn main() {
         let client_config = client_config::build(
             username,
             addresses,
-            settings.get_clients(),
+            settings.clients_list(),
             &tls_hosts_settings,
         );
         println!("{}", client_config.compose_toml());
@@ -221,13 +221,9 @@ fn main() {
     };
 
     let shutdown = Shutdown::new();
-    let authenticator: Option<Arc<dyn Authenticator>> = if !settings.get_clients().is_empty() {
-        Some(Arc::new(RegistryBasedAuthenticator::new(
-            settings.get_clients(),
-        )))
-    } else {
-        None
-    };
+    let authenticator: Option<Arc<dyn Authenticator>> = settings
+        .credentials_file_path()
+        .map(|path| Arc::new(FileBasedAuthenticator::new(path.to_string())) as Arc<dyn Authenticator>);
     let core = Arc::new(
         Core::new(
             settings,

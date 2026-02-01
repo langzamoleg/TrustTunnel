@@ -204,7 +204,14 @@ password = "secure_password_1"
 [[client]]
 username = "user2"
 password = "secure_password_2"
+valid_till = 1735689600
 ```
+
+**Optional field `valid_till`**: You can add a `valid_till` field to any client entry to set an expiration time for that user. The value must be a Unix timestamp (seconds since January 1, 1970 UTC).
+
+When `valid_till` is set, the authentication system checks the current time against this value on **every connection attempt**. If the current time exceeds `valid_till`, the user is automatically rejected and cannot connect. This allows for time-limited access without needing to manually remove credentials.
+
+Example: `valid_till = 1735689600` means the user is valid until December 31, 2024 at 00:00:00 UTC.
 
 ### Rules File (rules.toml)
 

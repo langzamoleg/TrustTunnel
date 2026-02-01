@@ -71,6 +71,12 @@ and the [GUI application][trusttunnel-flutter-client].
 - **Platform Compatibility**: The server is compatible with Linux and macOS.
   The client is available for Android, Apple, Windows, and Linux.
 
+- **File-Based Authentication**: Supports file-based authentication with automatic
+  credential reload. The server monitors the credentials file and applies changes
+  without requiring a restart. User credentials can have optional expiration times
+  using the `valid_till` field (Unix timestamp), automatically denying access to
+  expired users.
+
 ---
 
 ## Client Features
